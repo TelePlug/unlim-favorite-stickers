@@ -1,0 +1,38 @@
+name: Release script
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Prepare file
+        run: |
+          mkdir -p dist
+          cp unlim_favorite_stickers.py dist/unlim-favorite-stickers-${GITHUB_REF_NAME}.plugin
+
+      - name: Generate changelog
+        id: changelog
+        uses: orhun/git-cliff-action@v4
+        with:
+          config: cliff.toml
+          args: --latest --strip header
+
+      - name: Create GitHub Release
+        id: release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/unlim-favorite-stickers-${{ github.ref_name }}.plugin
+          body: ${{ steps.changelog.outputs.content }}
