@@ -63,7 +63,9 @@ def deserialize_sticker(data: dict):
 
     a = TLRPC.TL_documentAttributeSticker()
     ss = TLRPC.TL_inputStickerSetID()
-    ss.id = data["sticker_set_id"]
+    # serialize_sticker кладет sticker_set_id только если у стикера нашелся
+    # атрибут stickerset - у стикера без набора ключа не будет
+    ss.id = data.get("sticker_set_id", 0)
     a.stickerset = ss
     doc.attributes.add(a)
 
@@ -100,55 +102,75 @@ class StickersDB:
 
     def __load_db(self):
         """Чтение всех стикеров из базы в self.stickers"""
+        self.__stickers = {"accounts": {}, "stickers": {}}
         if not os.path.exists(self.__db_path):
-            self.__stickers = {"accounts": {}, "stickers": {}}
-        else:
-            with open(self.__db_path) as f:
+            return
+        try:
+            with open(self.__db_path, encoding="utf-8") as f:
                 self.__stickers = json.load(f)
+        except (OSError, ValueError) as e:
+            # Битый или недоступный файл - начинаем с пустой базы,
+            # иначе плагин не загрузится вообще
+            log(f"[favstickers] Не удалось прочитать базу стикеров: {e}")
 
     def __save_db(self):
         """Сохранение всех стикеров из self.stickers в базу"""
-        log(self.__stickers["accounts"])
-        with open(self.__db_path, "w") as f:
-            json.dump(self.__stickers, f)
+        tmp_path = self.__db_path + ".tmp"
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(self.__stickers, f, ensure_ascii=False)
+            # Подмена файла целиком: прерывание записи не оставит битую базу
+            os.replace(tmp_path, self.__db_path)
+        except OSError as e:
+            log(f"[favstickers] Не удалось сохранить базу стикеров: {e}")
 
     def get_all_stickers(self, account: int) -> list[dict[str, str | int]]:
         """Получение всех стикеров в виде объектов TLRPC$TL_document"""
         return [
             deserialize_sticker(self.__stickers["stickers"][i])
             for i in reversed(self.__stickers["accounts"].get(account, []))
+            if i in self.__stickers["stickers"]
         ]
 
     def add_sticker(self, sticker, account: int):
         """Сериализация и добавление стикера в базу без дубликатов"""
         serialized_sticker = serialize_sticker(sticker)
         sticker_id = str(serialized_sticker["id"])
+        changed = False
         if sticker_id not in self.__stickers["stickers"]:
             self.__stickers["stickers"][sticker_id] = serialized_sticker
+            changed = True
         if account not in self.__stickers["accounts"]:
             self.__stickers["accounts"][account] = []
         if sticker_id not in self.__stickers["accounts"][account]:
             self.__stickers["accounts"][account].append(sticker_id)
+            changed = True
+        if changed:
             self.__save_db()
 
     def remove_sticker(self, sticker, account: int):
         """Удаление стикера из базы и self.stickers."""
         serialized_sticker = serialize_sticker(sticker)
         sticker_id = str(serialized_sticker["id"])
-        if sticker_id in self.__stickers["accounts"][account]:
+        changed = False
+        if sticker_id in self.__stickers["accounts"].get(account, []):
             self.__stickers["accounts"][account].remove(sticker_id)
-            self.__save_db()
+            changed = True
         # Если ни у кого стикер не сохранен - удаляем из общего списка
         if sticker_id in self.__stickers["stickers"] and not any(
             sticker_id in i for i in self.__stickers["accounts"].values()
         ):
             del self.__stickers["stickers"][sticker_id]
+            changed = True
+        if changed:
             self.__save_db()
 
     def is_sticker_favorite(self, sticker, account: int):
         """Проверка, есть ли стикер в избранных"""
         serialized_sticker = serialize_sticker(sticker)
-        return str(serialized_sticker["id"]) in self.__stickers["accounts"][account]
+        return str(serialized_sticker["id"]) in self.__stickers["accounts"].get(
+            account, []
+        )
 
 
 class ChangeFavoriteStickerHook(MethodHook):
@@ -209,7 +231,7 @@ class MyPlugin(BasePlugin):
         """
         current_app = jclass("android.app.ActivityThread").currentApplication()
         if not current_app:
-            RuntimeError("app not find")
+            raise RuntimeError("app not find")
         return current_app
 
     @property
@@ -271,7 +293,7 @@ class MyPlugin(BasePlugin):
             J.Integer.TYPE,
         )
         getRecentStickersMethod.setAccessible(True)
-        self.unhook_obj = self.hook_method(
+        self.hook_method(
             getRecentStickersMethod,
             GetFavoriteStickersHook(
                 self.db.get_all_stickers, self.__get_current_account_id
@@ -283,7 +305,7 @@ class MyPlugin(BasePlugin):
             "isStickerInFavorites", jclass("org.telegram.tgnet.TLRPC$Document")
         )
         isStickerInFavoritesMethod.setAccessible(True)
-        self.unhook_obj = self.hook_method(
+        self.hook_method(
             isStickerInFavoritesMethod,
             IsStickerInFavoritesHook(
                 self.db.is_sticker_favorite, self.__get_current_account_id
