@@ -1,10 +1,8 @@
 import json
 import os
-from operator import ge
 
 from android_utils import log
 from base_plugin import BasePlugin, MethodHook
-from debugpy.adapter.sessions import get
 from hook_utils import find_class
 from java import jclass
 from ui.bulletin import BulletinHelper
