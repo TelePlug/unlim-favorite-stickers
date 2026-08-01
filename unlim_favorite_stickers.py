@@ -2,16 +2,18 @@ import json
 import os
 
 from android_utils import log
-from base_plugin import BasePlugin, MethodHook
+from base_plugin import BasePlugin, MethodHook, HookResult, HookStrategy
 from hook_utils import find_class
 from java import jclass
 from ui.bulletin import BulletinHelper
+from client_utils import get_last_fragment
+from android_utils import run_on_ui_thread
 
 __id__ = "favstickers"
 __name__ = "Unlim favorite stickers"
 __description__ = "Remove limits on adding stickers to favorites"
-__author__ = "@DaShMore"
-__version__ = "2.0.0"
+__author__ = "@DaShMore, @teleplugit & @InLoveWithUmi"
+__version__ = "2.1.0"
 __icon__ = "plugins_covers/0"
 __min_version__ = "11.12.0"
 
@@ -311,3 +313,317 @@ class MyPlugin(BasePlugin):
         )
 
         self.__load_favorite_stickers(media_instance)
+        self.__setup_backup_hooks(media_instance)
+
+    def __setup_backup_hooks(self, media_instance):
+        """
+        Регистрирует хуки для команды .sticker_export / импорта .stickers-файла.
+        Не трогает StickersDB - использует только её публичный API
+        (get_all_stickers/add_sticker), которое уже существует в этом классе.
+        """
+        # Официальный, документированный способ перехвата исходящих сообщений
+        # (вместо ручного перебора всех перегрузок SendMessagesHelper.sendMessage
+        # через reflection, который оказался ненадёжным на части сборок).
+        try:
+            self.add_on_send_message_hook()
+            log("[favstickers] add_on_send_message_hook зарегистрирован")
+        except Exception as e:
+            log(f"[favstickers] Не удалось зарегистрировать add_on_send_message_hook: {e}")
+
+        try:
+            JavaClassRef = jclass("java.lang.Class")
+            AndroidUtilitiesClass = JavaClassRef.forName("org.telegram.messenger.AndroidUtilities")
+            for m in AndroidUtilitiesClass.getMethods():
+                if m.getName() == "openForView" and len(m.getParameterTypes()) >= 1:
+                    try:
+                        m.setAccessible(True)
+                        self.hook_method(
+                            m,
+                            AndroidOpenFileHook(
+                                import_func=self.db.add_sticker,
+                                get_account_id=self.__get_current_account_id,
+                                media_update_func=media_instance.processLoadedRecentDocuments,
+                            ),
+                        )
+                    except Exception as e:
+                        log(f"[favstickers] Не удалось захукать перегрузку openForView {m}: {e}")
+        except Exception as e:
+            log(f"[favstickers] Ошибка инжекции импорта UI: {e}")
+
+    def on_send_message_hook(self, account: int, params) -> HookResult:
+        """
+        Официальный хук исходящих сообщений. Ловит команду .sticker_export
+        и отменяет обычную отправку (HookStrategy.CANCEL), вместо неё запускает
+        экспорт бэкапа избранных стикеров.
+        """
+        log(f"[favstickers] on_send_message_hook fired, has_message={hasattr(params, 'message')}")
+        if not hasattr(params, "message") or not isinstance(params.message, str):
+            return HookResult()
+        if params.message.strip() != ".sticker_export":
+            return HookResult()
+
+        try:
+            # account тут - индекс слота аккаунта (может быть не тем, что выбран
+            # на экране, если сработало для фонового аккаунта) - конвертируем
+            # его в тот же account_id (user_id), которым StickersDB ключует стикеры.
+            UserConfig = find_class("org.telegram.messenger.UserConfig")
+            account_id = str(UserConfig.getInstance(account).clientUserId)
+
+            clear_input_and_draft(account)
+
+            stickers = self.db.get_all_stickers(account_id)
+            if not stickers:
+                BulletinHelper.show_error("Нет сохранённых стикеров для экспорта", get_last_fragment())
+                return HookResult(strategy=HookStrategy.CANCEL)
+
+            serialized = [serialize_sticker(s) for s in stickers]
+            json_bytes = json.dumps(serialized, ensure_ascii=False).encode("utf-8")
+
+            context = self.__get_context()
+            uri = write_public_download(context, "favorites.stickers", json_bytes)
+
+            BulletinHelper.show_info("Выберите чат для отправки файла", get_last_fragment())
+            share_file(uri)
+        except Exception as e:
+            log(f"[favstickers] on_send_message_hook Error: {e}")
+
+        return HookResult(strategy=HookStrategy.CANCEL)
+
+
+# Новый функционал: экспорт/импорт бэкапа избранных стикеров.
+# Использует только публичный API StickersDB (get_all_stickers/add_sticker)
+# и уже существующие serialize_sticker/deserialize_sticker - сам класс
+# StickersDB и остальная логика плагина выше не изменены.
+
+
+def _find_download_uri(resolver, MediaStore, filename: str):
+    """
+    Ищет content:// URI файла с заданным именем в MediaStore.Downloads.
+    Не создаёт Java-массивы (String[] для projection/selectionArgs) - просто
+    запрашивает все столбцы и все строки, а фильтрует по имени в Python.
+    """
+    cursor = resolver.query(MediaStore.Downloads.EXTERNAL_CONTENT_URI, None, None, None, None)
+    if cursor is None:
+        return None
+    try:
+        name_idx = cursor.getColumnIndex("_display_name")
+        id_idx = cursor.getColumnIndex("_id")
+        if name_idx < 0 or id_idx < 0:
+            return None
+        while cursor.moveToNext():
+            if str(cursor.getString(name_idx)) == filename:
+                row_id = cursor.getLong(id_idx)
+                Uri = jclass("android.net.Uri")
+                return Uri.withAppendedPath(MediaStore.Downloads.EXTERNAL_CONTENT_URI, str(row_id))
+    finally:
+        cursor.close()
+    return None
+
+
+def write_public_download(context, filename: str, json_bytes: bytes) -> str:
+    """
+    Пишет файл в общую папку Download.
+    На Android 10+ (API 29+) прямая запись через File API блокируется Scoped
+    Storage на части форков/устройств (например AyuGram) - используем
+    MediaStore.Downloads, который создан специально для этого случая и не
+    требует WRITE_EXTERNAL_STORAGE. На старых Android - обычная запись в файл.
+    """
+    Build = jclass("android.os.Build")
+    sdk_int = int(Build.VERSION.SDK_INT)
+
+    if sdk_int >= 29:
+        ContentValues = jclass("android.content.ContentValues")
+        MediaStore = jclass("android.provider.MediaStore")
+        resolver = context.getContentResolver()
+
+        try:
+            existing_uri = _find_download_uri(resolver, MediaStore, filename)
+            if existing_uri is not None:
+                resolver.delete(existing_uri, None, None)
+        except Exception as e:
+            log(f"[favstickers] Не удалось удалить старый файл экспорта: {e}")
+
+        cv = ContentValues()
+        cv.put(MediaStore.MediaColumns.DISPLAY_NAME, filename)
+        cv.put(MediaStore.MediaColumns.MIME_TYPE, "application/octet-stream")
+        cv.put(MediaStore.MediaColumns.RELATIVE_PATH, "Download/")
+        target_uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, cv)
+        if target_uri is None:
+            raise IOError("MediaStore.insert вернул null - не удалось создать запись в Downloads")
+
+        pfd = resolver.openFileDescriptor(target_uri, "w")
+        fd = pfd.detachFd()
+        with os.fdopen(fd, "wb") as f:
+            f.write(json_bytes)
+        return str(target_uri)
+    else:
+        path = "/storage/emulated/0/Download/" + filename
+        with open(path, "wb") as f:
+            f.write(json_bytes)
+        return path
+
+
+def share_file(uri_string: str, mime_type: str = "application/octet-stream"):
+    """
+    Отправляет файл сразу в само приложение (setPackage на свой же пакет),
+    минуя системный выбор "через какое приложение отправить". Telegram/AyuGram/
+    exteraGram сами обрабатывают ACTION_SEND и показывают свой родной экран
+    выбора чата - точно так же, как при нажатии "Переслать".
+    """
+    try:
+        Intent = jclass("android.content.Intent")
+        Uri = jclass("android.net.Uri")
+        uri = Uri.parse(uri_string)
+
+        fragment = get_last_fragment()
+        activity = fragment.getParentActivity() if fragment else None
+        context = activity if activity is not None else jclass("android.app.ActivityThread").currentApplication()
+
+        send_intent = Intent(Intent.ACTION_SEND)
+        send_intent.setType(mime_type)
+        send_intent.putExtra(Intent.EXTRA_STREAM, uri)
+        send_intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        send_intent.setPackage(context.getPackageName())
+
+        if activity is None:
+            send_intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+
+        context.startActivity(send_intent)
+        return True
+    except Exception as e:
+        log(f"[favstickers] Ошибка открытия меню отправки: {e}")
+        return False
+
+
+def clear_input_and_draft(account: int):
+    """
+    Мы перехватываем sendMessage очень глубоко и полностью подменяем результат,
+    из-за чего обычная логика Telegram (очистка поля ввода + черновика после
+    отправки) не успевает сработать сама. Чистим руками.
+    """
+    try:
+        fragment = get_last_fragment()
+        if fragment is None:
+            return
+
+        try:
+            dialog_id = fragment.getDialogId()
+            MediaDataController = find_class("org.telegram.messenger.MediaDataController")
+            mdc = MediaDataController.getInstance(account)
+            try:
+                mdc.cleanDraft(dialog_id, 0, False)
+            except Exception:
+                mdc.cleanDraft(dialog_id, False)
+        except Exception as e:
+            log(f"[favstickers] Не удалось очистить черновик: {e}")
+
+        try:
+            fragment_class = fragment.getClass()
+            enter_view_field = None
+            klass = fragment_class
+            while klass is not None and enter_view_field is None:
+                try:
+                    enter_view_field = klass.getDeclaredField("chatActivityEnterView")
+                except Exception:
+                    klass = klass.getSuperclass()
+            if enter_view_field is not None:
+                enter_view_field.setAccessible(True)
+                enter_view = enter_view_field.get(fragment)
+                if enter_view is not None:
+                    enter_view.setFieldText("")
+        except Exception as e:
+            log(f"[favstickers] Не удалось очистить поле ввода: {e}")
+
+    except Exception as e:
+        log(f"[favstickers] clear_input_and_draft общая ошибка: {e}")
+
+
+class AndroidOpenFileHook(MethodHook):
+    """Перехватывает тап по .stickers-файлу в чате и предлагает импортировать."""
+
+    def __init__(self, import_func, get_account_id, media_update_func):
+        self.import_func = import_func
+        self.get_account_id = get_account_id
+        self.media_update = media_update_func
+
+    def before_hooked_method(self, param):
+        try:
+            if not param.args or param.args[0] is None:
+                return
+
+            arg = param.args[0]
+            arg_class = str(arg.getClass().getName()) if hasattr(arg, "getClass") else ""
+            file_path = None
+
+            if "MessageObject" in arg_class:
+                name = str(arg.getDocumentName()) if hasattr(arg, "getDocumentName") else ""
+                if name.endswith(".stickers"):
+                    if hasattr(arg, "messageOwner") and hasattr(arg.messageOwner, "attachPath") and arg.messageOwner.attachPath:
+                        file_path = str(arg.messageOwner.attachPath)
+                    else:
+                        FileLoader = find_class("org.telegram.messenger.FileLoader")
+                        doc = arg.getDocument()
+                        if doc:
+                            try:
+                                file_path = str(FileLoader.getInstance(int(self.get_account_id())).getPathToAttach(doc, True).getAbsolutePath())
+                            except Exception:
+                                pass
+            elif hasattr(arg, "getAbsolutePath"):
+                path = str(arg.getAbsolutePath())
+                if path.endswith(".stickers"):
+                    file_path = path
+
+            if not file_path or not file_path.endswith(".stickers"):
+                return
+
+            param.setResult(False)
+
+            if not os.path.exists(file_path):
+                BulletinHelper.show_info("Файл еще скачивается! Дождитесь окончания загрузки.", get_last_fragment())
+                return
+
+            account = self.get_account_id()
+
+            def do_import():
+                try:
+                    with open(file_path, "r", encoding="utf-8") as f:
+                        serialized_list = json.load(f)
+                    for data in serialized_list:
+                        sticker = deserialize_sticker(data)
+                        self.import_func(sticker, account)
+                except Exception as e:
+                    log(f"[favstickers] Ошибка импорта: {e}")
+                    BulletinHelper.show_error("Ошибка при импорте.", get_last_fragment())
+                    return
+
+                # Импорт уже успешен на этом моменте - дальше только обновление UI,
+                # его ошибка не должна выглядеть как провал самого импорта.
+                BulletinHelper.show_success("Стикеры успешно импортированы! Откройте панель стикеров.", get_last_fragment())
+                try:
+                    self.media_update()
+                except Exception as e:
+                    log(f"[favstickers] Не удалось обновить UI сразу (стикеры всё равно импортированы): {e}")
+
+            def show_import_dialog():
+                try:
+                    from ui.alert import AlertDialogBuilder
+
+                    fragment = get_last_fragment()
+                    activity = fragment.getParentActivity() if fragment else None
+                    if not activity:
+                        do_import()
+                        return
+
+                    builder = AlertDialogBuilder(activity)
+                    builder.set_title("Импорт стикеров")
+                    builder.set_message("Обнаружен файл резервной копии .stickers. Импортировать его?")
+                    builder.set_positive_button("Импортировать", lambda b, w: (b.dismiss(), do_import()))
+                    builder.set_negative_button("Отмена", lambda b, w: b.dismiss())
+                    builder.show()
+                except Exception as e:
+                    log(f"[favstickers] Dialog UI Exception: {e}")
+                    do_import()
+
+            run_on_ui_thread(show_import_dialog)
+        except Exception as e:
+            log(f"[favstickers] AndroidOpenFileHook Error: {e}")
