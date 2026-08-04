@@ -11,7 +11,11 @@ from android_utils import run_on_ui_thread
 
 __id__ = "favstickers"
 __name__ = "Unlim favorite stickers"
-__description__ = "Remove limits on adding stickers to favorites"
+__description__ = (
+    "Снимает лимит на избранные стикеры. "
+    "Команда .sticker_export выгружает бекап, "
+    "импорт - тап по .stickers-файлу в чате"
+)
 __author__ = "@DaShMore, @teleplugit & @InLoveWithUmi"
 __version__ = "2.1.0"
 __icon__ = "plugins_covers/0"
