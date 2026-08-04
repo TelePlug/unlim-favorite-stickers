@@ -342,6 +342,7 @@ class MyPlugin(BasePlugin):
                             AndroidOpenFileHook(
                                 import_func=self.db.add_sticker,
                                 get_account_id=self.__get_current_account_id,
+                                get_account_slot=self.__get_current_account,
                                 media_update_func=media_instance.processLoadedRecentDocuments,
                             ),
                         )
@@ -540,9 +541,13 @@ def clear_input_and_draft(account: int):
 class AndroidOpenFileHook(MethodHook):
     """Перехватывает тап по .stickers-файлу в чате и предлагает импортировать."""
 
-    def __init__(self, import_func, get_account_id, media_update_func):
+    def __init__(self, import_func, get_account_id, get_account_slot, media_update_func):
         self.import_func = import_func
+        # get_account_id - clientUserId, которым StickersDB ключует стикеры
+        # get_account_slot - индекс слота аккаунта, его ждут getInstance у
+        # телеграмовских контроллеров. Это разные числа, путать их нельзя
         self.get_account_id = get_account_id
+        self.get_account_slot = get_account_slot
         self.media_update = media_update_func
 
     def before_hooked_method(self, param):
@@ -564,7 +569,7 @@ class AndroidOpenFileHook(MethodHook):
                         doc = arg.getDocument()
                         if doc:
                             try:
-                                file_path = str(FileLoader.getInstance(int(self.get_account_id())).getPathToAttach(doc, True).getAbsolutePath())
+                                file_path = str(FileLoader.getInstance(self.get_account_slot()).getPathToAttach(doc, True).getAbsolutePath())
                             except Exception:
                                 pass
             elif hasattr(arg, "getAbsolutePath"):
