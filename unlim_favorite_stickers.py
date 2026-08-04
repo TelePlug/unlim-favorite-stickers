@@ -1,13 +1,12 @@
 import json
 import os
 
-from android_utils import log
-from base_plugin import BasePlugin, MethodHook, HookResult, HookStrategy
+from android_utils import log, run_on_ui_thread
+from base_plugin import BasePlugin, HookResult, HookStrategy, MethodHook
+from client_utils import get_last_fragment
 from hook_utils import find_class
 from java import jclass
 from ui.bulletin import BulletinHelper
-from client_utils import get_last_fragment
-from android_utils import run_on_ui_thread
 
 __id__ = "favstickers"
 __name__ = "Unlim favorite stickers"
@@ -117,7 +116,8 @@ class StickersDB:
     }
     """
 
-    # HACK все ключи при сохранении становятся строками, так что иногда надо приводить их вручную через str()
+    # HACK все ключи при сохранении становятся строками, так что иногда надо
+    # приводить их вручную через str()
     def __init__(self, db_path: str):
         self.__db_path = db_path
         self.__load_db()
@@ -389,10 +389,10 @@ class ChangeFavoriteStickerHook(MethodHook):
         # И что стикер не находится в избранном (not inFavs)
         if param.args[0] == 2 and not param.args[4]:
             self.__on_add_favorite(sticker, account_id)
-            BulletinHelper.show_success("Sticker added to favorites")
+            BulletinHelper.show_success("Стикер добавлен в избранные")
         elif param.args[0] == 2:
             self.__on_remove_favorite(sticker, account_id)
-            BulletinHelper.show_error("Sticker removed from favorites")
+            BulletinHelper.show_error("Стикер удалён из избранных")
         self.__on_update()
         param.setResult(None)
 
@@ -523,7 +523,9 @@ class ImportBackupHook(MethodHook):
                 added = self.__import_backup(f.read(), account)
         except Exception as e:
             log(f"[favstickers] Ошибка импорта: {e}")
-            BulletinHelper.show_error("Не удалось импортировать стикеры", get_last_fragment())
+            BulletinHelper.show_error(
+                "Не удалось импортировать стикеры", get_last_fragment()
+            )
             return
 
         BulletinHelper.show_success(
@@ -635,7 +637,9 @@ class MyPlugin(BasePlugin):
         # Перехват открытия файла: у openForView несколько перегрузок и на
         # форках их набор отличается, поэтому берём все по имени
         try:
-            AndroidUtilities = J.Class.forName("org.telegram.messenger.AndroidUtilities")
+            AndroidUtilities = J.Class.forName(
+                "org.telegram.messenger.AndroidUtilities"
+            )
             for method in AndroidUtilities.getMethods():
                 if method.getName() != "openForView":
                     continue
@@ -692,5 +696,3 @@ class MyPlugin(BasePlugin):
             )
 
         return HookResult(strategy=HookStrategy.CANCEL)
-
-
