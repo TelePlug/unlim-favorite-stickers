@@ -356,7 +356,6 @@ class MyPlugin(BasePlugin):
         и отменяет обычную отправку (HookStrategy.CANCEL), вместо неё запускает
         экспорт бэкапа избранных стикеров.
         """
-        log(f"[favstickers] on_send_message_hook fired, has_message={hasattr(params, 'message')}")
         if not hasattr(params, "message") or not isinstance(params.message, str):
             return HookResult()
         if params.message.strip() != ".sticker_export":
