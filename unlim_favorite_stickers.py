@@ -179,14 +179,16 @@ class ChangeFavoriteStickerHook(MethodHook):
         self.__get_account_id = get_account_id
 
     def before_hooked_method(self, param):
+        # Проверяем, что выбран пункт добавления / удаления из избранное (TYPE_FAVE = 2)
+        if param.args[0] != 2:
+            return
         sticker = param.args[2]
         account_id = self.__get_account_id()
-        # Проверяем, что выбран пункт добавления / удаления из избранное (TYPE_FAVE = 2)
         # И что стикер не находится в избранном (not inFavs)
-        if param.args[0] == 2 and not param.args[4]:
+        if not param.args[4]:
             self.__on_add_favorite(sticker, account_id)
             BulletinHelper.show_success("Sticker added to favorites")
-        elif param.args[0] == 2:
+        else:
             self.__on_remove_favorite(sticker, account_id)
             BulletinHelper.show_error("Sticker removed from favorites")
         self.__on_update()
@@ -199,6 +201,11 @@ class GetFavoriteStickersHook(MethodHook):
         self.__get_account_id = get_account_id
 
     def after_hooked_method(self, param):
+        # Хук висит на всех перегрузках getRecentStickers / getRecentStickersNoCopy,
+        # а тип списка везде идет первым аргументом (TYPE_FAVE = 2).
+        # Недавние, маски и премиум-стикеры не наши - их подменять нельзя.
+        if param.args[0] != 2:
+            return
         account = self.__get_account_id()
         favorite_stickers = self.__get_favorite_stickers(account)
         if not favorite_stickers:
@@ -285,18 +292,20 @@ class MyPlugin(BasePlugin):
             ),
         )
 
-        # Перехват метода получения списка избранных стикеров
-        getRecentStickersMethod = media_class.getDeclaredMethod(
-            "getRecentStickers",
-            J.Integer.TYPE,
-        )
-        getRecentStickersMethod.setAccessible(True)
-        self.hook_method(
-            getRecentStickersMethod,
-            GetFavoriteStickersHook(
-                self.db.get_all_stickers, self.__get_current_account_id
-            ),
-        )
+        # Перехват методов получения списка избранных стикеров.
+        # hook_all_methods, а не getDeclaredMethod: набор перегрузок
+        # getRecentStickers в разных сборках exteraGram отличается, и привязка
+        # к одной сигнатуре молча промахивается мимо той, которую зовет UI.
+        # getRecentStickersNoCopy идет тем же хуком - через него читают
+        # избранное подсказки стикеров по эмодзи.
+        for method_name in ("getRecentStickers", "getRecentStickersNoCopy"):
+            self.hook_all_methods(
+                media_class,
+                method_name,
+                GetFavoriteStickersHook(
+                    self.db.get_all_stickers, self.__get_current_account_id
+                ),
+            )
 
         # Перехват метода проверки наличия стикера в избранных
         isStickerInFavoritesMethod = media_class.getDeclaredMethod(
