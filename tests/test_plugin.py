@@ -74,17 +74,27 @@ def fake_jclass(name):
 class FakeBasePlugin:
     """Запоминает, что и как плагин просил перехватить."""
 
+    fail_on = None  # имя метода, перехват которого должен провалиться
+
     def __init__(self):
         self.hooked_methods = []
         self.hooked_by_name = []
+        self.unhooked = []
 
     def hook_method(self, method, hook, priority=None):
+        if self.fail_on == "addRecentSticker" and not self.hooked_methods:
+            return None
         self.hooked_methods.append((method, hook))
         return object()
 
     def hook_all_methods(self, cls, method_name, hook, priority=None):
+        if method_name == self.fail_on:
+            return None
         self.hooked_by_name.append((method_name, hook))
         return [object()]
+
+    def unhook_method(self, unhook):
+        self.unhooked.append(unhook)
 
 
 def install_stubs():
@@ -384,13 +394,12 @@ def test_two_arg_overload_is_handled():
     assert param.result_was_set
 
 
-def test_KNOWN_GAP_empty_db_falls_through_to_vanilla():
-    """§4: на пустой базе показывается ванильное избранное."""
+def test_empty_db_falls_through_to_vanilla():
+    """Так задумано: из ванильного списка идет первичный импорт базы."""
     hook = make_get_hook({})
     param = FakeParam([TYPE_FAVE])
     hook.after_hooked_method(param)
-    if param.result_was_set:
-        raise AssertionError("дыра закрыта - тест пора переписать")
+    assert not param.result_was_set
 
 
 # --- IsStickerInFavoritesHook --------------------------------------------
@@ -423,6 +432,42 @@ class FakeDB:
         return False
 
 
+def boom(*args):
+    raise RuntimeError("база недоступна")
+
+
+def test_failed_write_leaves_original_alone():
+    """Запись упала - пусть стикер уйдет хотя бы в ванильное избранное."""
+    hook = plugin.ChangeFavoriteStickerHook(boom, boom, boom, lambda: "42")
+    param = FakeParam([TYPE_FAVE, None, FakeSticker(100), 0, False])
+    hook.before_hooked_method(param)
+    assert not param.result_was_set, "оригинал отменять нечем - база не записана"
+    assert BULLETINS[-1][0] == "error", BULLETINS[-1]
+
+
+def test_failed_read_falls_back_to_vanilla():
+    hook = plugin.GetFavoriteStickersHook(boom, lambda: "42")
+    param = FakeParam([TYPE_FAVE])
+    hook.after_hooked_method(param)
+    assert not param.result_was_set
+
+
+def test_failed_favorite_check_falls_back_to_vanilla():
+    hook = plugin.IsStickerInFavoritesHook(boom, lambda: "42")
+    param = FakeParam([FakeSticker(1)])
+    hook.before_hooked_method(param)
+    assert not param.result_was_set
+
+
+def test_hook_failures_are_logged():
+    """Мост молчит про исключения в хуках - след должен остаться у нас."""
+    before = len(LOGS)
+    plugin.GetFavoriteStickersHook(boom, lambda: "42").after_hooked_method(
+        FakeParam([TYPE_FAVE])
+    )
+    assert len(LOGS) > before, "падение хука прошло бесследно"
+
+
 def test_all_list_accessors_are_hooked():
     """Правка охвата: оба аксессора вешаются по имени, а не по сигнатуре."""
     plugin.MyPlugin._MyPlugin__DB = FakeDB()
@@ -432,6 +477,38 @@ def test_all_list_accessors_are_hooked():
         names = [name for name, _ in instance.hooked_by_name]
         assert names == ["getRecentStickers", "getRecentStickersNoCopy"], names
         assert len(instance.hooked_methods) == 2, "addRecentSticker + isStickerInFavorites"
+        assert instance.unhooked == []
+    finally:
+        plugin.MyPlugin._MyPlugin__DB = None
+
+
+def test_partial_install_is_rolled_back():
+    """Полурабочий плагин хуже неработающего: снимаем уже поставленное."""
+    plugin.MyPlugin._MyPlugin__DB = FakeDB()
+    try:
+        instance = plugin.MyPlugin()
+        instance.fail_on = "getRecentStickers"
+        try:
+            instance.on_plugin_load()
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("загрузка должна была прерваться")
+        # addRecentSticker успел встать до отказа - он должен быть снят
+        assert len(instance.unhooked) == 1, instance.unhooked
+    finally:
+        plugin.MyPlugin._MyPlugin__DB = None
+
+
+def test_optional_accessor_absence_does_not_block_load():
+    """getRecentStickersNoCopy есть не во всех сборках - это не отказ."""
+    plugin.MyPlugin._MyPlugin__DB = FakeDB()
+    try:
+        instance = plugin.MyPlugin()
+        instance.fail_on = "getRecentStickersNoCopy"
+        instance.on_plugin_load()
+        assert [n for n, _ in instance.hooked_by_name] == ["getRecentStickers"]
+        assert instance.unhooked == []
     finally:
         plugin.MyPlugin._MyPlugin__DB = None
 
