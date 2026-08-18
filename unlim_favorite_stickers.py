@@ -124,11 +124,19 @@ class StickersDB:
 
     def get_all_stickers(self, account: int) -> list[dict[str, str | int]]:
         """Получение всех стикеров в виде объектов TLRPC$TL_document"""
-        return [
-            deserialize_sticker(self.__stickers["stickers"][i])
-            for i in reversed(self.__stickers["accounts"].get(account, []))
-            if i in self.__stickers["stickers"]
-        ]
+        stickers = []
+        for sticker_id in reversed(self.__stickers["accounts"].get(account, [])):
+            data = self.__stickers["stickers"].get(sticker_id)
+            if data is None:
+                continue
+            try:
+                stickers.append(deserialize_sticker(data))
+            except Exception as e:
+                # Одна битая запись не должна уносить весь список: исключение
+                # отсюда уходит в хук, где его глотает мост, и пользователь
+                # видит ванильное избранное вместо своего
+                log(f"[favstickers] Пропущен стикер {sticker_id}: {e}")
+        return stickers
 
     def add_sticker(self, sticker, account: int):
         """Сериализация и добавление стикера в базу без дубликатов"""
@@ -179,14 +187,25 @@ class ChangeFavoriteStickerHook(MethodHook):
         self.__get_account_id = get_account_id
 
     def before_hooked_method(self, param):
+        # Проверяем, что выбран пункт добавления / удаления из избранное (TYPE_FAVE = 2)
+        if param.args[0] != 2:
+            return
+        try:
+            self.__change_favorite(param)
+        except Exception as e:
+            # Мост глотает исключение молча: без setResult отработает оригинал
+            # и уведет стикер в ванильную пятерку. Скажем хотя бы об этом
+            log(f"[favstickers] Не удалось изменить избранное: {e!r}")
+            BulletinHelper.show_error("Failed to change favorites")
+
+    def __change_favorite(self, param):
         sticker = param.args[2]
         account_id = self.__get_account_id()
-        # Проверяем, что выбран пункт добавления / удаления из избранное (TYPE_FAVE = 2)
         # И что стикер не находится в избранном (not inFavs)
-        if param.args[0] == 2 and not param.args[4]:
+        if not param.args[4]:
             self.__on_add_favorite(sticker, account_id)
             BulletinHelper.show_success("Sticker added to favorites")
-        elif param.args[0] == 2:
+        else:
             self.__on_remove_favorite(sticker, account_id)
             BulletinHelper.show_error("Sticker removed from favorites")
         self.__on_update()
@@ -199,8 +218,19 @@ class GetFavoriteStickersHook(MethodHook):
         self.__get_account_id = get_account_id
 
     def after_hooked_method(self, param):
-        account = self.__get_account_id()
-        favorite_stickers = self.__get_favorite_stickers(account)
+        # Хук висит на всех перегрузках getRecentStickers / getRecentStickersNoCopy,
+        # а тип списка везде идет первым аргументом (TYPE_FAVE = 2).
+        # Недавние, маски и премиум-стикеры не наши - их подменять нельзя.
+        if param.args[0] != 2:
+            return
+        try:
+            favorite_stickers = self.__get_favorite_stickers(self.__get_account_id())
+        except Exception as e:
+            # Без setResult останется ванильный список - урезанный, но живой
+            log(f"[favstickers] Не удалось прочитать избранное: {e!r}")
+            return
+        # Пустая база - это еще не заполненная база: пропускаем ванильный
+        # список дальше, из него же потом идет первичный импорт
         if not favorite_stickers:
             return
         new_list = jclass("java.util.ArrayList")()
@@ -215,9 +245,14 @@ class IsStickerInFavoritesHook(MethodHook):
         self.__get_account_id = get_account_id
 
     def before_hooked_method(self, param):
-        sticker = param.args[0]
-        account = self.__get_account_id()
-        param.setResult(self.__is_favorite_sticker(sticker, account))
+        try:
+            favorite = self.__is_favorite_sticker(param.args[0], self.__get_account_id())
+        except Exception as e:
+            # Без setResult ответит оригинал: соврет про наши стикеры,
+            # но меню стикера откроется
+            log(f"[favstickers] Не удалось проверить избранное: {e!r}")
+            return
+        param.setResult(favorite)
 
 
 class MyPlugin(BasePlugin):
@@ -259,11 +294,55 @@ class MyPlugin(BasePlugin):
             for sticker in range(stickers.size() - 1, -1, -1):
                 self.db.add_sticker(stickers.get(sticker), account)
 
+    def __hook_one(self, method, hook, name: str, unhooks: list):
+        """Перехват конкретной сигнатуры.
+
+        hook_method умеет вернуть None вместо исключения - для нас это
+        такой же отказ, молчать о нем нельзя.
+        """
+        unhook = self.hook_method(method, hook)
+        if unhook is None:
+            raise RuntimeError(f"не удалось перехватить {name}")
+        unhooks.append(unhook)
+
+    def __hook_by_name(self, media_class, name: str, hook, unhooks: list, required=True):
+        """Перехват всех перегрузок метода по имени"""
+        installed = self.hook_all_methods(media_class, name, hook)
+        if not installed:
+            if required:
+                raise RuntimeError(f"не удалось перехватить {name}")
+            # Метод есть не во всех сборках, и без него теряется только
+            # часть функциональности - не повод отказывать в загрузке
+            log(f"[favstickers] {name} перехватить не удалось, пропускаем")
+            return
+        unhooks.extend(installed)
+
     def on_plugin_load(self):
         MediaController = find_class("org.telegram.messenger.MediaDataController")
-        TLRPCDocument = find_class("org.telegram.tgnet.TLRPC$Document")
         media_instance = MediaController.getInstance(self.__get_current_account())
         media_class = media_instance.getClass()
+
+        # Список копится по ходу установки, чтобы откатить уже поставленное:
+        # полурабочий плагин хуже неработающего. Если оборвать загрузку на
+        # середине, добавление продолжит уходить в базу, а список и звездочка
+        # будут браться из ванили - и пользователь увидит вечные пять стикеров
+        unhooks = []
+        try:
+            self.__install_hooks(media_class, media_instance, unhooks)
+        except Exception:
+            for unhook in unhooks:
+                self.unhook_method(unhook)
+            raise
+
+        self.__load_favorite_stickers(media_instance)
+
+    def __install_hooks(self, media_class, media_instance, unhooks: list):
+        """Ставит все хуки, складывая хендлы отката в unhooks
+
+        Хендлы нужны только на время загрузки: при выгрузке плагина мы хуки
+        намеренно не снимаем.
+        """
+        TLRPCDocument = find_class("org.telegram.tgnet.TLRPC$Document")
 
         # Перехват метода добавления стикера в избраные
         addRecentStickerMethod = media_class.getDeclaredMethod(
@@ -275,7 +354,7 @@ class MyPlugin(BasePlugin):
             J.Boolean.TYPE,
         )
         addRecentStickerMethod.setAccessible(True)
-        self.hook_method(
+        self.__hook_one(
             addRecentStickerMethod,
             ChangeFavoriteStickerHook(
                 on_add_favorite=self.db.add_sticker,
@@ -283,31 +362,41 @@ class MyPlugin(BasePlugin):
                 on_update=media_instance.processLoadedRecentDocuments,
                 get_account_id=self.__get_current_account_id,
             ),
+            "addRecentSticker",
+            unhooks,
         )
 
-        # Перехват метода получения списка избранных стикеров
-        getRecentStickersMethod = media_class.getDeclaredMethod(
-            "getRecentStickers",
-            J.Integer.TYPE,
-        )
-        getRecentStickersMethod.setAccessible(True)
-        self.hook_method(
-            getRecentStickersMethod,
-            GetFavoriteStickersHook(
-                self.db.get_all_stickers, self.__get_current_account_id
-            ),
-        )
+        # Перехват методов получения списка избранных стикеров.
+        # hook_all_methods, а не getDeclaredMethod: набор перегрузок
+        # getRecentStickers в разных сборках exteraGram отличается, и привязка
+        # к одной сигнатуре молча промахивается мимо той, которую зовет UI.
+        # getRecentStickersNoCopy идет тем же хуком - через него читают
+        # избранное подсказки стикеров по эмодзи.
+        # NoCopy не обязателен: без него избранное не увидят только подсказки
+        for method_name, required in (
+            ("getRecentStickers", True),
+            ("getRecentStickersNoCopy", False),
+        ):
+            self.__hook_by_name(
+                media_class,
+                method_name,
+                GetFavoriteStickersHook(
+                    self.db.get_all_stickers, self.__get_current_account_id
+                ),
+                unhooks,
+                required=required,
+            )
 
         # Перехват метода проверки наличия стикера в избранных
         isStickerInFavoritesMethod = media_class.getDeclaredMethod(
             "isStickerInFavorites", jclass("org.telegram.tgnet.TLRPC$Document")
         )
         isStickerInFavoritesMethod.setAccessible(True)
-        self.hook_method(
+        self.__hook_one(
             isStickerInFavoritesMethod,
             IsStickerInFavoritesHook(
                 self.db.is_sticker_favorite, self.__get_current_account_id
             ),
+            "isStickerInFavorites",
+            unhooks,
         )
-
-        self.__load_favorite_stickers(media_instance)
