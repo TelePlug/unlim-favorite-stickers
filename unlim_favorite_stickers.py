@@ -11,7 +11,7 @@ __id__ = "favstickers"
 __name__ = "Unlim favorite stickers"
 __description__ = "Remove limits on adding stickers to favorites"
 __author__ = "@DaShMore"
-__version__ = "2.0.0"
+__version__ = "2.0.1"
 __icon__ = "plugins_covers/0"
 __min_version__ = "11.12.0"
 
