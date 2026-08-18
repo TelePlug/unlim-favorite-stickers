@@ -124,11 +124,19 @@ class StickersDB:
 
     def get_all_stickers(self, account: int) -> list[dict[str, str | int]]:
         """Получение всех стикеров в виде объектов TLRPC$TL_document"""
-        return [
-            deserialize_sticker(self.__stickers["stickers"][i])
-            for i in reversed(self.__stickers["accounts"].get(account, []))
-            if i in self.__stickers["stickers"]
-        ]
+        stickers = []
+        for sticker_id in reversed(self.__stickers["accounts"].get(account, [])):
+            data = self.__stickers["stickers"].get(sticker_id)
+            if data is None:
+                continue
+            try:
+                stickers.append(deserialize_sticker(data))
+            except Exception as e:
+                # Одна битая запись не должна уносить весь список: исключение
+                # отсюда уходит в хук, где его глотает мост, и пользователь
+                # видит ванильное избранное вместо своего
+                log(f"[favstickers] Пропущен стикер {sticker_id}: {e}")
+        return stickers
 
     def add_sticker(self, sticker, account: int):
         """Сериализация и добавление стикера в базу без дубликатов"""
