@@ -288,28 +288,30 @@ def test_corrupt_json_falls_back_to_empty():
 # --- известные дыры: тесты фиксируют текущее поведение --------------------
 
 
-def test_KNOWN_GAP_wrong_shape_json_still_explodes():
-    """§5: валидный JSON не той формы проходит guard и падает при чтении."""
-    path = os.path.join(tempfile.mkdtemp(), "stickers.json")
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump([{"id": 1}], f)
-    db = plugin.StickersDB(path)
-    try:
-        db.get_all_stickers("42")
-    except TypeError:
-        return
-    raise AssertionError("дыра закрыта - тест пора переписать")
+def test_wrong_shape_json_falls_back_to_empty():
+    """Валидный JSON не той формы разбор проходит, а роняет чтение."""
+    for payload in ([{"id": 1}], {"accounts": {}}, "строка", 42):
+        path = os.path.join(tempfile.mkdtemp(), "stickers.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+        assert plugin.StickersDB(path).get_all_stickers("42") == [], payload
 
 
-def test_KNOWN_GAP_stickerset_without_id_explodes():
-    """serialize_sticker:47 - getattr без дефолта на наборе без поля id."""
+def test_sticker_without_stickerset_id_is_saved():
+    """TL_inputStickerSetEmpty: поля id нет, но стикер сохранить надо."""
     sticker = FakeSticker(100, set_id=None)
-    sticker.attributes.add(FakeAttribute(object()))  # TL_inputStickerSetEmpty
-    try:
-        plugin.serialize_sticker(sticker)
-    except AttributeError:
-        return
-    raise AssertionError("дыра закрыта - тест пора переписать")
+    sticker.attributes.add(FakeAttribute(object()))
+    data = plugin.serialize_sticker(sticker)
+    assert data["id"] == 100
+    assert "sticker_set_id" not in data, data
+
+
+def test_failed_save_tells_the_user():
+    """Иначе пользователь добавляет стикеры весь сеанс и теряет их."""
+    db = plugin.StickersDB(os.path.join(tempfile.mkdtemp(), "нет-каталога", "db.json"))
+    before = len(BULLETINS)
+    db.add_sticker(FakeSticker(100), "42")
+    assert BULLETINS[before:] and BULLETINS[-1][0] == "error", BULLETINS[before:]
 
 
 # --- ChangeFavoriteStickerHook -------------------------------------------
@@ -362,10 +364,13 @@ def test_mask_is_left_alone():
 # --- GetFavoriteStickersHook ---------------------------------------------
 
 
-def make_get_hook(stickers_by_account):
+def make_get_hook(stickers_by_account, imported=None):
     return plugin.GetFavoriteStickersHook(
         lambda account: stickers_by_account.get(account, []),
         lambda: "42",
+        lambda stickers, account: (imported if imported is not None else []).append(
+            (stickers, account)
+        ),
     )
 
 
@@ -400,6 +405,46 @@ def test_empty_db_falls_through_to_vanilla():
     param = FakeParam([TYPE_FAVE])
     hook.after_hooked_method(param)
     assert not param.result_was_set
+
+
+def test_empty_db_seeds_itself_from_vanilla_list():
+    """Импорт идет отсюда, а не с загрузки плагина: тут список уже готов."""
+    imported = []
+    hook = make_get_hook({}, imported)
+    vanilla = FakeArrayList()
+    vanilla.add(FakeSticker(1))
+    param = FakeParam([TYPE_FAVE], result=vanilla)
+    hook.after_hooked_method(param)
+    assert imported == [(vanilla, "42")], imported
+
+
+def test_filled_db_is_not_reimported():
+    imported = []
+    hook = make_get_hook({"42": [FakeSticker(1)]}, imported)
+    hook.after_hooked_method(FakeParam([TYPE_FAVE], result=FakeArrayList()))
+    assert imported == []
+
+
+def test_import_survives_empty_vanilla_list():
+    """Список еще не подтянулся с сервера - просто ждем следующего чтения."""
+    db, _ = make_db()
+    plugin_instance = plugin.MyPlugin()
+    plugin_instance._MyPlugin__DB = db
+    plugin_instance._MyPlugin__import_vanilla_favorites(None, "42")
+    plugin_instance._MyPlugin__import_vanilla_favorites(FakeArrayList(), "42")
+    assert db.get_all_stickers("42") == []
+
+
+def test_import_keeps_panel_order():
+    """Ванильный список идет новыми сверху, база хранит наоборот."""
+    db, _ = make_db()
+    plugin_instance = plugin.MyPlugin()
+    plugin_instance._MyPlugin__DB = db
+    vanilla = FakeArrayList()
+    vanilla.add(FakeSticker(100))
+    vanilla.add(FakeSticker(200))
+    plugin_instance._MyPlugin__import_vanilla_favorites(vanilla, "42")
+    assert [doc.id for doc in db.get_all_stickers("42")] == [100, 200]
 
 
 # --- IsStickerInFavoritesHook --------------------------------------------
@@ -446,7 +491,7 @@ def test_failed_write_leaves_original_alone():
 
 
 def test_failed_read_falls_back_to_vanilla():
-    hook = plugin.GetFavoriteStickersHook(boom, lambda: "42")
+    hook = plugin.GetFavoriteStickersHook(boom, lambda: "42", boom)
     param = FakeParam([TYPE_FAVE])
     hook.after_hooked_method(param)
     assert not param.result_was_set
@@ -462,7 +507,7 @@ def test_failed_favorite_check_falls_back_to_vanilla():
 def test_hook_failures_are_logged():
     """Мост молчит про исключения в хуках - след должен остаться у нас."""
     before = len(LOGS)
-    plugin.GetFavoriteStickersHook(boom, lambda: "42").after_hooked_method(
+    plugin.GetFavoriteStickersHook(boom, lambda: "42", boom).after_hooked_method(
         FakeParam([TYPE_FAVE])
     )
     assert len(LOGS) > before, "падение хука прошло бесследно"

@@ -44,7 +44,11 @@ def serialize_sticker(sticker) -> dict[str, str | int]:
             att = attr_list.get(i)
 
             if hasattr(att, "stickerset") and att.stickerset is not None:
-                data["sticker_set_id"] = getattr(att.stickerset, "id")
+                # У TL_inputStickerSetEmpty и TL_inputStickerSetShortName
+                # поля id нет вовсе - такой стикер сохраняем без набора
+                set_id = getattr(att.stickerset, "id", None)
+                if set_id is not None:
+                    data["sticker_set_id"] = set_id
     return data
 
 
@@ -98,6 +102,14 @@ class StickersDB:
         self.__db_path = db_path
         self.__load_db()
 
+    @staticmethod
+    def __has_expected_shape(stickers) -> bool:
+        return (
+            isinstance(stickers, dict)
+            and isinstance(stickers.get("accounts"), dict)
+            and isinstance(stickers.get("stickers"), dict)
+        )
+
     def __load_db(self):
         """Чтение всех стикеров из базы в self.stickers"""
         self.__stickers = {"accounts": {}, "stickers": {}}
@@ -105,11 +117,18 @@ class StickersDB:
             return
         try:
             with open(self.__db_path, encoding="utf-8") as f:
-                self.__stickers = json.load(f)
+                loaded = json.load(f)
         except (OSError, ValueError) as e:
             # Битый или недоступный файл - начинаем с пустой базы,
             # иначе плагин не загрузится вообще
             log(f"[favstickers] Не удалось прочитать базу стикеров: {e}")
+            return
+        if not self.__has_expected_shape(loaded):
+            # Валидный JSON не той формы разбор проходит, а падает потом на
+            # каждом обращении - уже внутри хука, где исключение никто не увидит
+            log("[favstickers] База стикеров не той формы, начинаем с пустой")
+            return
+        self.__stickers = loaded
 
     def __save_db(self):
         """Сохранение всех стикеров из self.stickers в базу"""
@@ -120,7 +139,10 @@ class StickersDB:
             # Подмена файла целиком: прерывание записи не оставит битую базу
             os.replace(tmp_path, self.__db_path)
         except OSError as e:
+            # Молча продолжать нельзя: пользователь будет добавлять стикеры
+            # весь сеанс и потеряет их при перезапуске
             log(f"[favstickers] Не удалось сохранить базу стикеров: {e}")
+            BulletinHelper.show_error("Failed to save favorite stickers")
 
     def get_all_stickers(self, account: int) -> list[dict[str, str | int]]:
         """Получение всех стикеров в виде объектов TLRPC$TL_document"""
@@ -213,9 +235,10 @@ class ChangeFavoriteStickerHook(MethodHook):
 
 
 class GetFavoriteStickersHook(MethodHook):
-    def __init__(self, get_favorite_stickers, get_account_id):
+    def __init__(self, get_favorite_stickers, get_account_id, import_stickers):
         self.__get_favorite_stickers = get_favorite_stickers
         self.__get_account_id = get_account_id
+        self.__import_stickers = import_stickers
 
     def after_hooked_method(self, param):
         # Хук висит на всех перегрузках getRecentStickers / getRecentStickersNoCopy,
@@ -224,14 +247,19 @@ class GetFavoriteStickersHook(MethodHook):
         if param.args[0] != 2:
             return
         try:
-            favorite_stickers = self.__get_favorite_stickers(self.__get_account_id())
+            self.__replace_with_saved(param)
         except Exception as e:
             # Без setResult останется ванильный список - урезанный, но живой
             log(f"[favstickers] Не удалось прочитать избранное: {e!r}")
-            return
-        # Пустая база - это еще не заполненная база: пропускаем ванильный
-        # список дальше, из него же потом идет первичный импорт
+
+    def __replace_with_saved(self, param):
+        account = self.__get_account_id()
+        favorite_stickers = self.__get_favorite_stickers(account)
         if not favorite_stickers:
+            # Пустая база - это еще не заполненная база. Засеваем ее из
+            # ванильного списка и пропускаем его дальше: на загрузке плагина
+            # он мог быть еще не подтянут с сервера, а здесь он уже готов
+            self.__import_stickers(param.getResult(), account)
             return
         new_list = jclass("java.util.ArrayList")()
         for sticker in favorite_stickers:
@@ -287,12 +315,18 @@ class MyPlugin(BasePlugin):
         user_id = UserConfig.getInstance(UserConfig.selectedAccount).clientUserId
         return str(user_id)
 
-    def __load_favorite_stickers(self, mediaController):
-        account = self.__get_current_account_id()
-        if not self.db.get_all_stickers(account):
-            stickers = mediaController.getRecentStickers(2)
-            for sticker in range(stickers.size() - 1, -1, -1):
-                self.db.add_sticker(stickers.get(sticker), account)
+    def __import_vanilla_favorites(self, stickers, account: str):
+        """Первичное заполнение базы ванильным избранным
+
+        Зовется из хука на чтение списка, а не при загрузке плагина: там
+        recentStickers еще мог не подтянуться с сервера, и импорт молча
+        забирал пустоту или огрызок.
+        """
+        if stickers is None:
+            return
+        # С конца, чтобы порядок в базе совпал с порядком в панели
+        for i in range(stickers.size() - 1, -1, -1):
+            self.db.add_sticker(stickers.get(i), account)
 
     def __hook_one(self, method, hook, name: str, unhooks: list):
         """Перехват конкретной сигнатуры.
@@ -333,8 +367,6 @@ class MyPlugin(BasePlugin):
             for unhook in unhooks:
                 self.unhook_method(unhook)
             raise
-
-        self.__load_favorite_stickers(media_instance)
 
     def __install_hooks(self, media_class, media_instance, unhooks: list):
         """Ставит все хуки, складывая хендлы отката в unhooks
@@ -381,7 +413,9 @@ class MyPlugin(BasePlugin):
                 media_class,
                 method_name,
                 GetFavoriteStickersHook(
-                    self.db.get_all_stickers, self.__get_current_account_id
+                    self.db.get_all_stickers,
+                    self.__get_current_account_id,
+                    self.__import_vanilla_favorites,
                 ),
                 unhooks,
                 required=required,
