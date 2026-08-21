@@ -62,6 +62,13 @@ class FakeBulletinHelper:
         BULLETINS.append(("error", text))
 
 
+class JInt:
+    """java.jint: мост боксирует такое значение как java.lang.Integer."""
+
+    def __init__(self, value):
+        self.value = value
+
+
 def fake_jclass(name):
     if name == "java.util.ArrayList":
         return FakeArrayList
@@ -97,6 +104,13 @@ class FakeBasePlugin:
         self.unhooked.append(unhook)
 
 
+JAVA_CLASSES = {}
+
+
+def fake_find_class(name):
+    return JAVA_CLASSES.setdefault(name, MagicMock())
+
+
 def install_stubs():
     android_utils = types.ModuleType("android_utils")
     android_utils.log = LOGS.append
@@ -106,10 +120,11 @@ def install_stubs():
     base_plugin.MethodHook = type("MethodHook", (), {})
 
     hook_utils = types.ModuleType("hook_utils")
-    hook_utils.find_class = lambda name: MagicMock()
+    hook_utils.find_class = fake_find_class
 
     java = types.ModuleType("java")
     java.jclass = fake_jclass
+    java.jint = JInt
 
     ui = types.ModuleType("ui")
     ui_bulletin = types.ModuleType("ui.bulletin")
@@ -288,39 +303,41 @@ def test_corrupt_json_falls_back_to_empty():
 # --- известные дыры: тесты фиксируют текущее поведение --------------------
 
 
-def test_KNOWN_GAP_wrong_shape_json_still_explodes():
-    """§5: валидный JSON не той формы проходит guard и падает при чтении."""
-    path = os.path.join(tempfile.mkdtemp(), "stickers.json")
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump([{"id": 1}], f)
-    db = plugin.StickersDB(path)
-    try:
-        db.get_all_stickers("42")
-    except TypeError:
-        return
-    raise AssertionError("дыра закрыта - тест пора переписать")
+def test_wrong_shape_json_falls_back_to_empty():
+    """Валидный JSON не той формы разбор проходит, а роняет чтение."""
+    for payload in ([{"id": 1}], {"accounts": {}}, "строка", 42):
+        path = os.path.join(tempfile.mkdtemp(), "stickers.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+        assert plugin.StickersDB(path).get_all_stickers("42") == [], payload
 
 
-def test_KNOWN_GAP_stickerset_without_id_explodes():
-    """serialize_sticker:47 - getattr без дефолта на наборе без поля id."""
+def test_sticker_without_stickerset_id_is_saved():
+    """TL_inputStickerSetEmpty: поля id нет, но стикер сохранить надо."""
     sticker = FakeSticker(100, set_id=None)
-    sticker.attributes.add(FakeAttribute(object()))  # TL_inputStickerSetEmpty
-    try:
-        plugin.serialize_sticker(sticker)
-    except AttributeError:
-        return
-    raise AssertionError("дыра закрыта - тест пора переписать")
+    sticker.attributes.add(FakeAttribute(object()))
+    data = plugin.serialize_sticker(sticker)
+    assert data["id"] == 100
+    assert "sticker_set_id" not in data, data
+
+
+def test_failed_save_tells_the_user():
+    """Иначе пользователь добавляет стикеры весь сеанс и теряет их."""
+    db = plugin.StickersDB(os.path.join(tempfile.mkdtemp(), "нет-каталога", "db.json"))
+    before = len(BULLETINS)
+    db.add_sticker(FakeSticker(100), "42")
+    assert BULLETINS[before:] and BULLETINS[-1][0] == "error", BULLETINS[before:]
 
 
 # --- ChangeFavoriteStickerHook -------------------------------------------
 
 
 def make_change_hook():
-    calls = {"add": [], "remove": [], "update": 0}
+    calls = {"add": [], "remove": [], "refresh": []}
     hook = plugin.ChangeFavoriteStickerHook(
         on_add_favorite=lambda s, a: calls["add"].append((s, a)),
         on_remove_favorite=lambda s, a: calls["remove"].append((s, a)),
-        on_update=lambda: calls.__setitem__("update", calls["update"] + 1),
+        refresh_panel=lambda: calls["refresh"].append(True),
         get_account_id=lambda: "42",
     )
     return hook, calls
@@ -342,6 +359,25 @@ def test_fave_remove_goes_to_remove_branch():
     assert param.result_was_set
 
 
+def test_fave_change_refreshes_panel():
+    """Панель обновлял отмененный нами оригинал - теперь это наша забота."""
+    for remove in (False, True):
+        hook, calls = make_change_hook()
+        hook.before_hooked_method(
+            FakeParam([TYPE_FAVE, None, FakeSticker(100), 0, remove])
+        )
+        assert calls["refresh"] == [True], (remove, calls["refresh"])
+
+
+def test_refresh_passes_java_integer():
+    """Голый int мост боксирует в Long, а слушатель ждет Integer."""
+    plugin.MyPlugin._MyPlugin__notify_favorites_changed()
+    center = JAVA_CLASSES["org.telegram.messenger.NotificationCenter"]
+    args = center.getInstance.return_value.postNotificationName.call_args[0]
+    assert isinstance(args[2], JInt), type(args[2])
+    assert args[2].value == TYPE_FAVE
+
+
 def test_recent_sticker_is_left_alone():
     """Отправка стикера: TYPE_IMAGE не наш, оригинал отменять нельзя."""
     hook, calls = make_change_hook()
@@ -349,7 +385,7 @@ def test_recent_sticker_is_left_alone():
     hook.before_hooked_method(param)
     assert calls["add"] == [] and calls["remove"] == []
     assert not param.result_was_set, "недавние перестанут пополняться"
-    assert calls["update"] == 0
+    assert calls["refresh"] == []
 
 
 def test_mask_is_left_alone():
@@ -362,10 +398,13 @@ def test_mask_is_left_alone():
 # --- GetFavoriteStickersHook ---------------------------------------------
 
 
-def make_get_hook(stickers_by_account):
+def make_get_hook(stickers_by_account, imported=None):
     return plugin.GetFavoriteStickersHook(
         lambda account: stickers_by_account.get(account, []),
         lambda: "42",
+        lambda stickers, account: (imported if imported is not None else []).append(
+            (stickers, account)
+        ),
     )
 
 
@@ -400,6 +439,46 @@ def test_empty_db_falls_through_to_vanilla():
     param = FakeParam([TYPE_FAVE])
     hook.after_hooked_method(param)
     assert not param.result_was_set
+
+
+def test_empty_db_seeds_itself_from_vanilla_list():
+    """Импорт идет отсюда, а не с загрузки плагина: тут список уже готов."""
+    imported = []
+    hook = make_get_hook({}, imported)
+    vanilla = FakeArrayList()
+    vanilla.add(FakeSticker(1))
+    param = FakeParam([TYPE_FAVE], result=vanilla)
+    hook.after_hooked_method(param)
+    assert imported == [(vanilla, "42")], imported
+
+
+def test_filled_db_is_not_reimported():
+    imported = []
+    hook = make_get_hook({"42": [FakeSticker(1)]}, imported)
+    hook.after_hooked_method(FakeParam([TYPE_FAVE], result=FakeArrayList()))
+    assert imported == []
+
+
+def test_import_survives_empty_vanilla_list():
+    """Список еще не подтянулся с сервера - просто ждем следующего чтения."""
+    db, _ = make_db()
+    plugin_instance = plugin.MyPlugin()
+    plugin_instance._MyPlugin__DB = db
+    plugin_instance._MyPlugin__import_vanilla_favorites(None, "42")
+    plugin_instance._MyPlugin__import_vanilla_favorites(FakeArrayList(), "42")
+    assert db.get_all_stickers("42") == []
+
+
+def test_import_keeps_panel_order():
+    """Ванильный список идет новыми сверху, база хранит наоборот."""
+    db, _ = make_db()
+    plugin_instance = plugin.MyPlugin()
+    plugin_instance._MyPlugin__DB = db
+    vanilla = FakeArrayList()
+    vanilla.add(FakeSticker(100))
+    vanilla.add(FakeSticker(200))
+    plugin_instance._MyPlugin__import_vanilla_favorites(vanilla, "42")
+    assert [doc.id for doc in db.get_all_stickers("42")] == [100, 200]
 
 
 # --- IsStickerInFavoritesHook --------------------------------------------
@@ -438,7 +517,7 @@ def boom(*args):
 
 def test_failed_write_leaves_original_alone():
     """Запись упала - пусть стикер уйдет хотя бы в ванильное избранное."""
-    hook = plugin.ChangeFavoriteStickerHook(boom, boom, boom, lambda: "42")
+    hook = plugin.ChangeFavoriteStickerHook(boom, boom, lambda: None, lambda: "42")
     param = FakeParam([TYPE_FAVE, None, FakeSticker(100), 0, False])
     hook.before_hooked_method(param)
     assert not param.result_was_set, "оригинал отменять нечем - база не записана"
@@ -446,7 +525,7 @@ def test_failed_write_leaves_original_alone():
 
 
 def test_failed_read_falls_back_to_vanilla():
-    hook = plugin.GetFavoriteStickersHook(boom, lambda: "42")
+    hook = plugin.GetFavoriteStickersHook(boom, lambda: "42", boom)
     param = FakeParam([TYPE_FAVE])
     hook.after_hooked_method(param)
     assert not param.result_was_set
@@ -462,7 +541,7 @@ def test_failed_favorite_check_falls_back_to_vanilla():
 def test_hook_failures_are_logged():
     """Мост молчит про исключения в хуках - след должен остаться у нас."""
     before = len(LOGS)
-    plugin.GetFavoriteStickersHook(boom, lambda: "42").after_hooked_method(
+    plugin.GetFavoriteStickersHook(boom, lambda: "42", boom).after_hooked_method(
         FakeParam([TYPE_FAVE])
     )
     assert len(LOGS) > before, "падение хука прошло бесследно"

@@ -1,3 +1,5 @@
 .venv
 .zed
 .worktrees
+__pycache__
+stickers.json*
