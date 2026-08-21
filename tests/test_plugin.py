@@ -1221,6 +1221,48 @@ def test_import_of_missing_file_says_to_wait():
     assert BULLETINS[-1][0] == "info"
 
 
+def test_safety_snapshot_goes_to_saved_messages():
+    """Кеш приватный: без рута пользователь оттуда ничего не достанет."""
+    source, _ = make_db()
+    source.add_sticker(FakeSticker(100), "42")
+    target, _ = make_db()
+    target.add_sticker(FakeSticker(999), "42")
+    instance = make_plugin_with_db(target)
+    instance._MyPlugin__on_backup_tap(write_backup_file(source.export_account("42")))
+    before = len(SENT_DOCUMENTS)
+    DIALOGS[-1].press("neutral")
+    sent = SENT_DOCUMENTS[before:]
+    assert sent, "слепок должен уйти в Избранное"
+    assert "before-import" in sent[-1][1], sent[-1]
+    assert json.load(open(sent[-1][1]))["accounts"]["42"] == ["999"]
+    assert "Избранное" in BULLETINS[-1][1], BULLETINS[-1]
+
+
+def test_two_replaces_keep_both_snapshots():
+    """Второй слепок не должен затирать первый - он и есть страховка."""
+    source, _ = make_db()
+    source.add_sticker(FakeSticker(100), "42")
+    backup = write_backup_file(source.export_account("42"))
+    target, _ = make_db()
+    target.add_sticker(FakeSticker(999), "42")
+    instance = make_plugin_with_db(target)
+    names = set()
+    for _ in range(2):
+        instance._MyPlugin__on_backup_tap(backup)
+        DIALOGS[-1].press("neutral")
+        names.add(SENT_DOCUMENTS[-1][1])
+    assert len(names) == 2, names
+
+
+def test_dialog_mentions_accounts_for_snapshot():
+    source, _ = make_db()
+    source.add_sticker(FakeSticker(100), "42")
+    source.add_sticker(FakeSticker(200), "43")
+    instance = make_plugin_with_db(make_db()[0])
+    instance._MyPlugin__on_backup_tap(write_backup_file(source.export_all()))
+    assert "аккаунт" in DIALOGS[-1].message, DIALOGS[-1].message
+
+
 # --- раннер ---------------------------------------------------------------
 
 if __name__ == "__main__":

@@ -1,6 +1,7 @@
 import datetime as dt
 import json
 import os
+import uuid
 
 from android_utils import log, run_on_ui_thread
 from base_plugin import BasePlugin, MethodHook
@@ -739,12 +740,14 @@ class MyPlugin(BasePlugin):
                 # Без Activity диалог не показать, а молча заменять нельзя
                 self.__apply_import(data, replace=False)
                 return
-            count = len(data["stickers"])
+            if detect_scope(data) == "all":
+                count = len(data["stickers"])
+                what = f"В файле {count} стикеров из {len(data['accounts'])} аккаунтов"
+            else:
+                what = f"В файле {len(data['stickers'])} стикеров"
             builder = AlertDialogBuilder(activity)
             builder.set_title("Импорт избранного")
-            builder.set_message(
-                f"В файле {count} стикеров. Добавить их к текущим или заменить?"
-            )
+            builder.set_message(f"{what}. Добавить их к текущим или заменить?")
             builder.set_positive_button(
                 "Добавить",
                 lambda b, w: (b.dismiss(), self.__apply_import(data, False)),
@@ -760,13 +763,32 @@ class MyPlugin(BasePlugin):
             BulletinHelper.show_error("Не удалось показать диалог импорта", fragment)
 
     def __save_safety_snapshot(self):
-        """Слепок перед заменой: единственная разрушительная операция плагина"""
+        """Слепок перед заменой: единственная разрушительная операция плагина
+
+        Уходит в Избранное, а не только в кеш: кеш - приватный каталог
+        приложения, и без рута пользователь оттуда ничего не достанет.
+        В Избранном слепок можно просто открыть и импортировать обратно.
+
+        Хвост в имени не для красоты: отправка может читать файл позже,
+        и одноимённый слепок следующей замены испортил бы её содержимое.
+        """
+        stamp = dt.date.today().isoformat()
         path = os.path.join(
             get_cache_dir(),
-            f"favorites-before-import-{dt.date.today().isoformat()}{BACKUP_SUFFIX}",
+            f"favorites-before-import-{stamp}-{uuid.uuid4().hex[:6]}{BACKUP_SUFFIX}",
         )
         write_file(path, json.dumps(self.db.export_all(), ensure_ascii=False))
         log(f"[favstickers] Страховочный слепок базы: {path}")
+        try:
+            send_document(
+                int(self.__get_current_account_id()),
+                path,
+                "Избранное до импорта",
+            )
+        except Exception as e:
+            # Копия в кеше уже есть, поэтому замену не отменяем: отказать
+            # в импорте из-за неудачной отправки хуже, чем импортировать
+            log(f"[favstickers] Не удалось отправить страховочный слепок: {e!r}")
 
     def __apply_import(self, data: dict, replace: bool):
         fragment = None
@@ -784,6 +806,8 @@ class MyPlugin(BasePlugin):
             message = f"Импортировано {applied}"
             if skipped:
                 message += f", пропущено {skipped}"
+            if replace:
+                message += ". Прежнее избранное отправлено в Избранное"
             BulletinHelper.show_success(message, fragment)
         except Exception as e:
             log(f"[favstickers] Импорт не удался: {e!r}")
