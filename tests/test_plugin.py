@@ -69,6 +69,84 @@ class JInt:
         self.value = value
 
 
+class FakeSettingItem:
+    """Дataclass-подобные элементы ui.settings: важны поля, не поведение."""
+
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
+
+
+class FakeHeader(FakeSettingItem):
+    def __init__(self, text):
+        super().__init__(text=text)
+
+
+class FakeDivider(FakeSettingItem):
+    def __init__(self, text=""):
+        super().__init__(text=text)
+
+
+class FakeText(FakeSettingItem):
+    def __init__(self, text, on_click=None, **kwargs):
+        super().__init__(text=text, on_click=on_click, **kwargs)
+
+
+DIALOGS = []
+
+
+class FakeAlertDialogBuilder:
+    """Запоминает, что показали и какие кнопки повесили."""
+
+    def __init__(self, context):
+        self.context = context
+        self.title = None
+        self.message = None
+        self.buttons = {}
+        self.shown = False
+        DIALOGS.append(self)
+
+    def set_title(self, title):
+        self.title = title
+        return self
+
+    def set_message(self, message):
+        self.message = message
+        return self
+
+    def _button(self, kind, text, listener):
+        self.buttons[kind] = (text, listener)
+        return self
+
+    def set_positive_button(self, text, listener=None):
+        return self._button("positive", text, listener)
+
+    def set_neutral_button(self, text, listener=None):
+        return self._button("neutral", text, listener)
+
+    def set_negative_button(self, text, listener=None):
+        return self._button("negative", text, listener)
+
+    def show(self):
+        self.shown = True
+        return self
+
+    def dismiss(self):
+        return None
+
+    def press(self, kind):
+        """Нажать кнопку так, как это сделал бы пользователь."""
+        self.buttons[kind][1](self, 0)
+
+
+SENT_DOCUMENTS = []
+CACHE_DIR = tempfile.mkdtemp()
+
+
+class FakeFragment:
+    def getParentActivity(self):
+        return object()
+
+
 def fake_jclass(name):
     if name == "java.util.ArrayList":
         return FakeArrayList
@@ -114,6 +192,7 @@ def fake_find_class(name):
 def install_stubs():
     android_utils = types.ModuleType("android_utils")
     android_utils.log = LOGS.append
+    android_utils.run_on_ui_thread = lambda func, delay=0: func()
 
     base_plugin = types.ModuleType("base_plugin")
     base_plugin.BasePlugin = FakeBasePlugin
@@ -130,6 +209,25 @@ def install_stubs():
     ui_bulletin = types.ModuleType("ui.bulletin")
     ui_bulletin.BulletinHelper = FakeBulletinHelper
 
+    ui_settings = types.ModuleType("ui.settings")
+    ui_settings.Header = FakeHeader
+    ui_settings.Divider = FakeDivider
+    ui_settings.Text = FakeText
+
+    ui_alert = types.ModuleType("ui.alert")
+    ui_alert.AlertDialogBuilder = FakeAlertDialogBuilder
+
+    client_utils = types.ModuleType("client_utils")
+    client_utils.send_document = lambda peer, file_path, caption="": SENT_DOCUMENTS.append(
+        (peer, file_path, caption)
+    )
+    client_utils.get_last_fragment = FakeFragment
+
+    file_utils = types.ModuleType("file_utils")
+    file_utils.get_cache_dir = lambda: CACHE_DIR
+    file_utils.write_file = lambda path, content: open(path, "w", encoding="utf-8").write(content)
+    file_utils.read_file = lambda path: open(path, encoding="utf-8").read()
+
     sys.modules.update(
         {
             "android_utils": android_utils,
@@ -138,6 +236,10 @@ def install_stubs():
             "java": java,
             "ui": ui,
             "ui.bulletin": ui_bulletin,
+            "ui.settings": ui_settings,
+            "ui.alert": ui_alert,
+            "client_utils": client_utils,
+            "file_utils": file_utils,
         }
     )
 
