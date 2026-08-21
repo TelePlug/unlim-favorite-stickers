@@ -498,6 +498,38 @@ def test_export_all_is_a_database_snapshot():
     assert data["stickers"]["100"]["id"] == 100
 
 
+def test_parse_backup_accepts_both_formats():
+    account_file = json.dumps({"version": 1, "stickers": []})
+    all_file = json.dumps({"version": 1, "accounts": {}, "stickers": {}})
+    assert plugin.detect_scope(plugin.parse_backup(account_file)) == "account"
+    assert plugin.detect_scope(plugin.parse_backup(all_file)) == "all"
+
+
+def test_parse_backup_rejects_future_version():
+    text = json.dumps({"version": 99, "stickers": []})
+    try:
+        plugin.parse_backup(text)
+    except plugin.BackupError as e:
+        assert "новой версией" in str(e), str(e)
+    else:
+        raise AssertionError("будущая версия должна быть отклонена")
+
+
+def test_parse_backup_rejects_garbage():
+    for text in ("не json", json.dumps([1, 2]), json.dumps({"version": 1})):
+        try:
+            plugin.parse_backup(text)
+        except plugin.BackupError:
+            continue
+        raise AssertionError(f"мусор принят за бекап: {text}")
+
+
+def test_backup_filename_marks_scope():
+    assert plugin.backup_filename("account").endswith(".stickers")
+    assert "-all-" in plugin.backup_filename("all")
+    assert "-all-" not in plugin.backup_filename("account")
+
+
 def test_counts_for_settings_screen():
     db, _ = make_db()
     db.add_sticker(FakeSticker(100), "42")

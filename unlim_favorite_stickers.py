@@ -88,6 +88,36 @@ def deserialize_sticker(data: dict):
     return doc
 
 
+def backup_filename(scope: str) -> str:
+    """Имя файла бекапа: favorites-2026-08-22.stickers"""
+    suffix = "-all" if scope == "all" else ""
+    return f"favorites{suffix}-{dt.date.today().isoformat()}{BACKUP_SUFFIX}"
+
+
+def detect_scope(data: dict) -> str:
+    """Слепок базы отличается от списка одного аккаунта ключом accounts"""
+    return "all" if isinstance(data.get("accounts"), dict) else "account"
+
+
+def parse_backup(text: str) -> dict:
+    """Разбор файла бекапа. На любой брак - BackupError с причиной"""
+    try:
+        data = json.loads(text)
+    except ValueError:
+        raise BackupError("Файл не похож на бекап стикеров")
+    if not isinstance(data, dict):
+        raise BackupError("Файл не похож на бекап стикеров")
+    if data.get("version") != BACKUP_VERSION:
+        raise BackupError("Файл сделан более новой версией плагина")
+    if isinstance(data.get("accounts"), dict) and isinstance(
+        data.get("stickers"), dict
+    ):
+        return data
+    if isinstance(data.get("stickers"), list):
+        return data
+    raise BackupError("Файл не похож на бекап стикеров")
+
+
 class StickersDB:
     """
     Класс для работы с базой данных стикеров
