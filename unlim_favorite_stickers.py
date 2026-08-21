@@ -202,10 +202,9 @@ class StickersDB:
 
 
 class ChangeFavoriteStickerHook(MethodHook):
-    def __init__(self, on_add_favorite, on_remove_favorite, on_update, get_account_id):
+    def __init__(self, on_add_favorite, on_remove_favorite, get_account_id):
         self.__on_add_favorite = on_add_favorite
         self.__on_remove_favorite = on_remove_favorite
-        self.__on_update = on_update
         self.__get_account_id = get_account_id
 
     def before_hooked_method(self, param):
@@ -230,7 +229,6 @@ class ChangeFavoriteStickerHook(MethodHook):
         else:
             self.__on_remove_favorite(sticker, account_id)
             BulletinHelper.show_error("Sticker removed from favorites")
-        self.__on_update()
         param.setResult(None)
 
 
@@ -391,7 +389,6 @@ class MyPlugin(BasePlugin):
             ChangeFavoriteStickerHook(
                 on_add_favorite=self.db.add_sticker,
                 on_remove_favorite=self.db.remove_sticker,
-                on_update=media_instance.processLoadedRecentDocuments,
                 get_account_id=self.__get_current_account_id,
             ),
             "addRecentSticker",

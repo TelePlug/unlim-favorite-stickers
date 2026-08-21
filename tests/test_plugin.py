@@ -322,7 +322,6 @@ def make_change_hook():
     hook = plugin.ChangeFavoriteStickerHook(
         on_add_favorite=lambda s, a: calls["add"].append((s, a)),
         on_remove_favorite=lambda s, a: calls["remove"].append((s, a)),
-        on_update=lambda: calls.__setitem__("update", calls["update"] + 1),
         get_account_id=lambda: "42",
     )
     return hook, calls
@@ -483,7 +482,7 @@ def boom(*args):
 
 def test_failed_write_leaves_original_alone():
     """Запись упала - пусть стикер уйдет хотя бы в ванильное избранное."""
-    hook = plugin.ChangeFavoriteStickerHook(boom, boom, boom, lambda: "42")
+    hook = plugin.ChangeFavoriteStickerHook(boom, boom, lambda: "42")
     param = FakeParam([TYPE_FAVE, None, FakeSticker(100), 0, False])
     hook.before_hooked_method(param)
     assert not param.result_was_set, "оригинал отменять нечем - база не записана"
