@@ -498,6 +498,29 @@ def test_export_all_is_a_database_snapshot():
     assert data["stickers"]["100"]["id"] == 100
 
 
+def test_import_all_restores_every_account():
+    source, _ = make_db()
+    source.add_sticker(FakeSticker(100), "42")
+    source.add_sticker(FakeSticker(200), "42")
+    source.add_sticker(FakeSticker(300), "43")
+    target, _ = make_db()
+    applied, skipped = target.import_all(source.export_all())
+    assert (applied, skipped) == (3, 0)
+    assert [doc.id for doc in target.get_all_stickers("42")] == [200, 100]
+    assert [doc.id for doc in target.get_all_stickers("43")] == [300]
+
+
+def test_import_all_replace_leaves_absent_accounts_alone():
+    """Замена трогает только аккаунты, которые есть в файле."""
+    source, _ = make_db()
+    source.add_sticker(FakeSticker(100), "42")
+    backup = source.export_all()
+    target, _ = make_db()
+    target.add_sticker(FakeSticker(999), "43")
+    target.import_all(backup, replace=True)
+    assert [doc.id for doc in target.get_all_stickers("43")] == [999]
+
+
 def test_import_roundtrip_keeps_order():
     source, _ = make_db()
     source.add_sticker(FakeSticker(100), "42")

@@ -385,6 +385,22 @@ class StickersDB:
         self.__save_db()
         return applied, skipped
 
+    def import_all(self, data: dict, replace: bool = False) -> tuple:
+        """Импорт слепка: каждый аккаунт восстанавливается по своему id"""
+        applied = skipped = 0
+        records = data.get("stickers", {})
+        for account, ids in data.get("accounts", {}).items():
+            # import_account ждет порядок панели, в слепке порядок базы
+            payload = {
+                "stickers": [records[i] for i in reversed(ids) if i in records]
+            }
+            account_applied, account_skipped = self.import_account(
+                payload, account, replace
+            )
+            applied += account_applied
+            skipped += account_skipped
+        return applied, skipped
+
 
 class ChangeFavoriteStickerHook(MethodHook):
     def __init__(self, on_add_favorite, on_remove_favorite, refresh_panel, get_account_id):
