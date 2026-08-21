@@ -558,6 +558,20 @@ def test_import_skips_broken_records():
     assert (applied, skipped) == (1, 2)
 
 
+def test_import_of_wrong_format_does_not_wipe_account():
+    """Слепок базы в import_account: замена не должна стирать избранное."""
+    db, _ = make_db()
+    db.add_sticker(FakeSticker(100), "42")
+    snapshot = db.export_all()
+    try:
+        db.import_account(snapshot, "42", replace=True)
+    except plugin.BackupError:
+        pass
+    else:
+        raise AssertionError("чужой формат должен быть отвергнут")
+    assert [doc.id for doc in db.get_all_stickers("42")] == [100]
+
+
 def test_parse_backup_accepts_both_formats():
     account_file = json.dumps({"version": 1, "stickers": []})
     all_file = json.dumps({"version": 1, "accounts": {}, "stickers": {}})

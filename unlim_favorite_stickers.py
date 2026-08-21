@@ -348,13 +348,19 @@ class StickersDB:
         ImportResult из спеки - это кортеж (применено, пропущено):
         заводить датакласс ради двух чисел незачем.
         """
+        records = data.get("stickers", [])
+        # Проверяем форму до мутации: режим замены стирает список аккаунта,
+        # и на чужом формате это была бы потеря данных с отчётом (0, N),
+        # неотличимым от "файл был пустой"
+        if not isinstance(records, list):
+            raise BackupError("Файл не похож на бекап стикеров")
         account = str(account)
         applied = skipped = 0
         if replace:
             self.__stickers["accounts"][account] = []
         ids = self.__stickers["accounts"].setdefault(account, [])
         # В файле новые сверху, база хранит наоборот
-        for record in reversed(data.get("stickers", [])):
+        for record in reversed(records):
             if not self.__is_valid_record(record):
                 skipped += 1
                 log(f"[favstickers] Пропущена запись бекапа: {str(record)[:80]}")
