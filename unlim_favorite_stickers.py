@@ -529,11 +529,14 @@ class ImportBackupHook(MethodHook):
             return None
         if hasattr(arg, "getAbsolutePath"):
             path = str(arg.getAbsolutePath())
-            return path if path.endswith(BACKUP_SUFFIX) else None
+            return path if path.lower().endswith(BACKUP_SUFFIX) else None
         name = str(arg.getDocumentName()) if hasattr(arg, "getDocumentName") else ""
-        if not name.endswith(BACKUP_SUFFIX):
+        if not name.lower().endswith(BACKUP_SUFFIX):
             return None
-        # Скачанный файл лежит по attachPath
+        # Файл ещё не скачан: не перехватываем намеренно. Перехват отменяет
+        # оригинал, а именно он, судя по всему, и запускает докачку - иначе
+        # тап показывал бы "дождитесь загрузки" и сам же её и предотвращал.
+        # Случай "путь есть, а файла на диске нет" ловится дальше, при чтении
         attach_path = getattr(getattr(arg, "messageOwner", None), "attachPath", None)
         return str(attach_path) if attach_path else None
 

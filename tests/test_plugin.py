@@ -1131,6 +1131,16 @@ def test_hook_survives_empty_args():
     assert not param.result_was_set
 
 
+def test_backup_tap_ignores_extension_case():
+    """Файл могли переименовать вручную."""
+    taps = []
+    hook = plugin.ImportBackupHook(taps.append)
+    param = FakeParam([FakeFile("/cache/Favorites-2026-08-22.STICKERS")])
+    hook.before_hooked_method(param)
+    assert param.set_result_value is False
+    assert len(taps) == 1
+
+
 # --- раннер ---------------------------------------------------------------
 
 if __name__ == "__main__":
