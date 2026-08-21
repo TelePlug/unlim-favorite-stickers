@@ -174,7 +174,7 @@ class StickersDB:
         if cached is not None:
             return cached
         stickers = []
-        for sticker_id in reversed(self.__stickers["accounts"].get(account, [])):
+        for sticker_id in self.__ordered_ids(account):
             data = self.__stickers["stickers"].get(sticker_id)
             if data is None:
                 continue
@@ -232,13 +232,30 @@ class StickersDB:
             str(account), []
         )
 
-    def count_stickers(self, account) -> int:
-        """Сколько стикеров у аккаунта - без разбора, только длина списка"""
-        return len(self.__stickers["accounts"].get(str(account), []))
+    def __ordered_ids(self, account: str) -> list:
+        """Id стикеров аккаунта в порядке панели, без висячих ссылок
 
-    def count_all(self) -> tuple:
-        """(всего стикеров, всего аккаунтов)"""
-        return len(self.__stickers["stickers"]), len(self.__stickers["accounts"])
+        Правило одно для чтения, экспорта и счётчиков: иначе на кнопке
+        экспорта окажется одно число, а в файле другое.
+        """
+        return [
+            sticker_id
+            for sticker_id in reversed(self.__stickers["accounts"].get(account, []))
+            if sticker_id in self.__stickers["stickers"]
+        ]
+
+    def count_stickers(self, account) -> int:
+        """Сколько стикеров у аккаунта попадёт в панель и в экспорт"""
+        return len(self.__ordered_ids(str(account)))
+
+    def count_all(self) -> tuple[int, int]:
+        """(всего стикеров, аккаунтов с непустым избранным)
+
+        Аккаунт, у которого удалили последний стикер, остаётся в базе с
+        пустым списком - в счётчик для экрана настроек он попадать не должен.
+        """
+        accounts = sum(1 for ids in self.__stickers["accounts"].values() if ids)
+        return len(self.__stickers["stickers"]), accounts
 
     def export_account(self, account) -> dict:
         """Плоский список в порядке панели, без упоминания аккаунтов"""
@@ -247,8 +264,7 @@ class StickersDB:
             "version": BACKUP_VERSION,
             "stickers": [
                 self.__stickers["stickers"][sticker_id]
-                for sticker_id in reversed(self.__stickers["accounts"].get(account, []))
-                if sticker_id in self.__stickers["stickers"]
+                for sticker_id in self.__ordered_ids(account)
             ],
         }
 

@@ -494,14 +494,39 @@ def test_export_all_is_a_database_snapshot():
     assert data["version"] == 1
     assert sorted(data["accounts"]) == ["42", "43"]
     assert sorted(data["stickers"]) == ["100", "200"]
+    assert data["accounts"]["42"] == ["100"], data["accounts"]
+    assert data["stickers"]["100"]["id"] == 100
 
 
 def test_counts_for_settings_screen():
     db, _ = make_db()
     db.add_sticker(FakeSticker(100), "42")
-    db.add_sticker(FakeSticker(200), "43")
+    db.add_sticker(FakeSticker(200), "42")
+    db.add_sticker(FakeSticker(300), "43")
+    assert db.count_stickers("42") == 2
+    assert db.count_all() == (3, 2)
+
+
+def test_counts_ignore_dangling_ids():
+    """Счётчик на кнопке экспорта должен совпадать с содержимым файла."""
+    db, _ = make_db(
+        {
+            "accounts": {"42": ["100", "нет-такого"]},
+            "stickers": {
+                "100": {"id": 100, "access_hash": 1, "dc_id": 2,
+                        "mime_type": "image/webp"}
+            },
+        }
+    )
     assert db.count_stickers("42") == 1
-    assert db.count_all() == (2, 2)
+    assert len(db.export_account("42")["stickers"]) == 1
+
+
+def test_emptied_account_is_not_counted():
+    db, _ = make_db()
+    db.add_sticker(FakeSticker(100), "42")
+    db.remove_sticker(FakeSticker(100), "42")
+    assert db.count_all() == (0, 0)
 
 
 # --- ChangeFavoriteStickerHook -------------------------------------------
