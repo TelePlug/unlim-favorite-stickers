@@ -1055,6 +1055,47 @@ def test_export_of_empty_db_sends_nothing():
     assert BULLETINS[-1][0] == "info", BULLETINS[-1]
 
 
+def test_settings_screen_survives_broken_db():
+    """Экран строится в Java-UI: исключение отсюда никто не увидит."""
+
+    class BrokenDB:
+        def count_stickers(self, account):
+            raise RuntimeError("база недоступна")
+
+        def count_all(self):
+            raise RuntimeError("база недоступна")
+
+    instance = make_plugin_with_db(BrokenDB())
+    before = len(LOGS)
+    items = instance.create_settings()
+    assert items, "экран не должен оказаться пустым"
+    assert any("favstickers" in line for line in LOGS[before:]), LOGS[before:]
+
+
+def test_export_reports_failure_without_fragment():
+    """Падение get_last_fragment не должно съедать плашку об ошибке.
+
+    Плагин импортировал get_last_fragment по имени (from client_utils
+    import get_last_fragment), поэтому подмена атрибута на модуле
+    client_utils плагина не коснётся - __export резолвит имя в
+    пространстве имён самого модуля плагина. Подменяем там.
+    """
+    db, _ = make_db()
+    db.add_sticker(FakeSticker(100), "42")
+    instance = make_plugin_with_db(db)
+
+    def broken_get_last_fragment():
+        raise RuntimeError("нет фрагмента")
+
+    original = plugin.get_last_fragment
+    plugin.get_last_fragment = broken_get_last_fragment
+    try:
+        instance.create_settings()[1].on_click(None)
+    finally:
+        plugin.get_last_fragment = original
+    assert BULLETINS[-1][0] == "error", BULLETINS[-1]
+
+
 # --- раннер ---------------------------------------------------------------
 
 if __name__ == "__main__":

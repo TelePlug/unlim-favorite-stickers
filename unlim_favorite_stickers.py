@@ -593,23 +593,33 @@ class MyPlugin(BasePlugin):
         версии ui.settings параметра subtext нет, и лишний аргумент уронил
         бы построение экрана целиком.
         """
-        own = self.db.count_stickers(self.__get_current_account_id())
-        total, accounts = self.db.count_all()
-        return [
-            Header(text="Бекап избранного"),
-            Text(
-                text=f"Экспорт текущего аккаунта ({own})",
-                on_click=lambda view: self.__export_current(),
-            ),
-            Text(
-                text=f"Экспорт всех аккаунтов ({total} в {accounts})",
-                on_click=lambda view: self.__export_all(),
-            ),
-            Divider(
-                text="Чтобы восстановить, откройте файл .stickers "
-                "в любом чате и подтвердите импорт"
-            ),
-        ]
+        try:
+            own = self.db.count_stickers(self.__get_current_account_id())
+            total, accounts = self.db.count_all()
+            return [
+                Header(text="Бекап избранного"),
+                Text(
+                    text=f"Экспорт текущего аккаунта ({own})",
+                    on_click=lambda view: self.__export_current(),
+                ),
+                Text(
+                    text=f"Экспорт всех аккаунтов ({total} в {accounts})",
+                    on_click=lambda view: self.__export_all(),
+                ),
+                Divider(
+                    text="Чтобы восстановить, откройте файл .stickers "
+                    "в любом чате и подтвердите импорт"
+                ),
+            ]
+        except Exception as e:
+            # Экран строится в Java-UI, где исключение глотается молча:
+            # без этой ветки пользователь получил бы пустые настройки
+            # безо всякого объяснения
+            log(f"[favstickers] Не удалось построить настройки: {e!r}")
+            return [
+                Header(text="Бекап избранного"),
+                Divider(text="Не удалось прочитать базу стикеров"),
+            ]
 
     def __export_current(self):
         self.__export(
@@ -631,8 +641,9 @@ class MyPlugin(BasePlugin):
         Колбэк настроек выполняется в Java-UI, где исключение проглатывается
         так же молча, как в хуках, поэтому каждая ветка заканчивается плашкой.
         """
-        fragment = get_last_fragment()
+        fragment = None
         try:
+            fragment = get_last_fragment()
             if not data.get("stickers"):
                 BulletinHelper.show_info(empty_message, fragment)
                 return
