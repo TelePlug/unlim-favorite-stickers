@@ -387,9 +387,23 @@ class StickersDB:
 
     def import_all(self, data: dict, replace: bool = False) -> tuple:
         """Импорт слепка: каждый аккаунт восстанавливается по своему id"""
-        applied = skipped = 0
+        accounts = data.get("accounts", {})
         records = data.get("stickers", {})
-        for account, ids in data.get("accounts", {}).items():
+        # Форму слепка проверяем до первой мутации: import_account сохраняет
+        # базу после каждого аккаунта, и падение на середине оставило бы
+        # восстановление наполовину сделанным, да ещё и на диске
+        if not isinstance(accounts, dict) or not isinstance(records, dict):
+            raise BackupError("Файл не похож на бекап стикеров")
+        applied = skipped = 0
+        for account, ids in accounts.items():
+            if not isinstance(ids, list):
+                # Строка или словарь развернулись бы через reversed() молча,
+                # и аккаунт восстановился бы из мусора вместо стикеров
+                log(
+                    f"[favstickers] Пропущен аккаунт {account}: "
+                    "список стикеров испорчен"
+                )
+                continue
             # import_account ждет порядок панели, в слепке порядок базы
             payload = {
                 "stickers": [records[i] for i in reversed(ids) if i in records]

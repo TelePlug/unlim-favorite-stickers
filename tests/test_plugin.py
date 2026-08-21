@@ -521,6 +521,33 @@ def test_import_all_replace_leaves_absent_accounts_alone():
     assert [doc.id for doc in target.get_all_stickers("43")] == [999]
 
 
+def test_import_all_rejects_broken_snapshot_before_touching_db():
+    """Падение на середине оставило бы базу восстановленной наполовину."""
+    db, _ = make_db()
+    db.add_sticker(FakeSticker(100), "42")
+    for broken in ({"accounts": [], "stickers": {}}, {"accounts": {}, "stickers": []}):
+        try:
+            db.import_all(broken, replace=True)
+        except plugin.BackupError:
+            pass
+        else:
+            raise AssertionError(f"испорченный слепок принят: {broken}")
+    assert [doc.id for doc in db.get_all_stickers("42")] == [100]
+
+
+def test_import_all_skips_account_with_broken_list():
+    """Строка вместо списка развернулась бы reversed() молча."""
+    source, _ = make_db()
+    source.add_sticker(FakeSticker(100), "42")
+    backup = source.export_all()
+    backup["accounts"]["43"] = "не список"
+    target, _ = make_db()
+    applied, skipped = target.import_all(backup)
+    assert applied == 1, applied
+    assert target.get_all_stickers("43") == []
+    assert [doc.id for doc in target.get_all_stickers("42")] == [100]
+
+
 def test_import_roundtrip_keeps_order():
     source, _ = make_db()
     source.add_sticker(FakeSticker(100), "42")
