@@ -1,11 +1,16 @@
+import datetime as dt
 import json
 import os
 
-from android_utils import log
+from android_utils import log, run_on_ui_thread
 from base_plugin import BasePlugin, MethodHook
+from client_utils import get_last_fragment, send_document
+from file_utils import get_cache_dir, read_file, write_file
 from hook_utils import find_class
 from java import jclass, jint
+from ui.alert import AlertDialogBuilder
 from ui.bulletin import BulletinHelper
+from ui.settings import Divider, Header, Text
 
 __id__ = "favstickers"
 __name__ = "Unlim favorite stickers"
@@ -24,6 +29,15 @@ class Jclass:
 J = Jclass()
 TLRPC = jclass("org.telegram.tgnet.TLRPC")
 ArrayList = jclass("java.util.ArrayList")
+
+BACKUP_VERSION = 1
+BACKUP_SUFFIX = ".stickers"
+BACKUP_CAPTION = "Бекап избранных стикеров"
+REQUIRED_STICKER_FIELDS = ("id", "access_hash", "dc_id", "mime_type")
+
+
+class BackupError(Exception):
+    """Причина отказа импорта, пригодная для показа пользователю"""
 
 
 def serialize_sticker(sticker) -> dict[str, str | int]:
