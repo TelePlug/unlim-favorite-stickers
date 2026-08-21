@@ -1209,6 +1209,50 @@ def test_recognition_failure_stays_silent():
     assert BULLETINS[before:] == [], BULLETINS[before:]
 
 
+class FakeMessageOwner:
+    def __init__(self, attach_path):
+        self.attachPath = attach_path
+
+
+class FakeMessageObject:
+    """Вложение в чате: именно так тап приходит в openForView"""
+
+    def __init__(self, name, attach_path=""):
+        self.__name = name
+        self.messageOwner = FakeMessageOwner(attach_path)
+
+    def getDocumentName(self):
+        return self.__name
+
+
+def test_backup_message_is_intercepted():
+    taps = []
+    hook = plugin.ImportBackupHook(taps.append)
+    param = FakeParam([FakeMessageObject("favorites.stickers", "/cache/downloaded.stickers")])
+    hook.before_hooked_method(param)
+    assert param.set_result_value is False
+    assert taps == ["/cache/downloaded.stickers"]
+
+
+def test_not_downloaded_message_is_left_to_telegram():
+    """Перехват отменил бы оригинал, а он же и запускает докачку."""
+    taps = []
+    hook = plugin.ImportBackupHook(taps.append)
+    param = FakeParam([FakeMessageObject("favorites.stickers", "")])
+    hook.before_hooked_method(param)
+    assert not param.result_was_set
+    assert taps == []
+
+
+def test_foreign_message_is_left_alone():
+    taps = []
+    hook = plugin.ImportBackupHook(taps.append)
+    param = FakeParam([FakeMessageObject("отчёт.pdf", "/cache/отчёт.pdf")])
+    hook.before_hooked_method(param)
+    assert not param.result_was_set
+    assert taps == []
+
+
 # --- диалог и применение импорта ------------------------------------------
 
 
