@@ -97,9 +97,12 @@ class StickersDB:
     }
     """
 
-    # HACK все ключи при сохранении становятся строками, так что иногда надо приводить их вручную через str()
+    # JSON умеет только строковые ключи, поэтому id аккаунта приводится к
+    # str на входе в каждый публичный метод - иначе вызов с int тихо
+    # промахнется мимо своих же записей и вернет пустой список
     def __init__(self, db_path: str):
         self.__db_path = db_path
+        self.__cache = {}
         self.__load_db()
 
     @staticmethod
@@ -112,6 +115,7 @@ class StickersDB:
 
     def __load_db(self):
         """Чтение всех стикеров из базы в self.stickers"""
+        self.__cache.clear()
         self.__stickers = {"accounts": {}, "stickers": {}}
         if not os.path.exists(self.__db_path):
             return
@@ -144,8 +148,17 @@ class StickersDB:
             log(f"[favstickers] Не удалось сохранить базу стикеров: {e}")
             BulletinHelper.show_error("Failed to save favorite stickers")
 
-    def get_all_stickers(self, account: int) -> list[dict[str, str | int]]:
-        """Получение всех стикеров в виде объектов TLRPC$TL_document"""
+    def get_all_stickers(self, account) -> list:
+        """Получение всех стикеров в виде объектов TLRPC$TL_document
+
+        Результат кешируется: метод зовется на каждой перерисовке панели и
+        на каждом нажатии клавиши в подсказках по эмодзи, а разбор одной
+        записи - это четыре конструктора и семь присваиваний через JNI.
+        """
+        account = str(account)
+        cached = self.__cache.get(account)
+        if cached is not None:
+            return cached
         stickers = []
         for sticker_id in reversed(self.__stickers["accounts"].get(account, [])):
             data = self.__stickers["stickers"].get(sticker_id)
@@ -158,10 +171,12 @@ class StickersDB:
                 # отсюда уходит в хук, где его глотает мост, и пользователь
                 # видит ванильное избранное вместо своего
                 log(f"[favstickers] Пропущен стикер {sticker_id}: {e}")
+        self.__cache[account] = stickers
         return stickers
 
-    def add_sticker(self, sticker, account: int):
+    def add_sticker(self, sticker, account):
         """Сериализация и добавление стикера в базу без дубликатов"""
+        account = str(account)
         serialized_sticker = serialize_sticker(sticker)
         sticker_id = str(serialized_sticker["id"])
         changed = False
@@ -174,10 +189,12 @@ class StickersDB:
             self.__stickers["accounts"][account].append(sticker_id)
             changed = True
         if changed:
+            self.__cache.clear()
             self.__save_db()
 
-    def remove_sticker(self, sticker, account: int):
+    def remove_sticker(self, sticker, account):
         """Удаление стикера из базы и self.stickers."""
+        account = str(account)
         serialized_sticker = serialize_sticker(sticker)
         sticker_id = str(serialized_sticker["id"])
         changed = False
@@ -191,13 +208,14 @@ class StickersDB:
             del self.__stickers["stickers"][sticker_id]
             changed = True
         if changed:
+            self.__cache.clear()
             self.__save_db()
 
-    def is_sticker_favorite(self, sticker, account: int):
+    def is_sticker_favorite(self, sticker, account):
         """Проверка, есть ли стикер в избранных"""
         serialized_sticker = serialize_sticker(sticker)
         return str(serialized_sticker["id"]) in self.__stickers["accounts"].get(
-            account, []
+            str(account), []
         )
 
 

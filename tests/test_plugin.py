@@ -269,6 +269,44 @@ def test_sticker_without_set_is_readable():
     assert len(db.get_all_stickers("42")) == 1
 
 
+def test_account_key_survives_int_and_str():
+    """JSON хранит ключи строками, а id аккаунта может прийти числом."""
+    db, _ = make_db()
+    db.add_sticker(FakeSticker(100), 42)
+    assert len(db.get_all_stickers("42")) == 1
+    assert db.is_sticker_favorite(FakeSticker(100), 42) is True
+    db.remove_sticker(FakeSticker(100), "42")
+    assert db.get_all_stickers(42) == []
+
+
+def test_repeated_reads_reuse_deserialized_documents():
+    """Разбор идет через JNI, а метод зовут на каждой перерисовке панели."""
+    db, _ = make_db()
+    db.add_sticker(FakeSticker(100), "42")
+    first = db.get_all_stickers("42")
+    assert db.get_all_stickers("42") is first
+
+
+def test_cache_is_dropped_on_change():
+    db, _ = make_db()
+    db.add_sticker(FakeSticker(100), "42")
+    before = db.get_all_stickers("42")
+    db.add_sticker(FakeSticker(200), "42")
+    after = db.get_all_stickers("42")
+    assert after is not before
+    assert [doc.id for doc in after] == [200, 100]
+    db.remove_sticker(FakeSticker(200), "42")
+    assert [doc.id for doc in db.get_all_stickers("42")] == [100]
+
+
+def test_cache_does_not_leak_between_accounts():
+    db, _ = make_db()
+    db.add_sticker(FakeSticker(100), "42")
+    db.add_sticker(FakeSticker(200), "43")
+    assert [doc.id for doc in db.get_all_stickers("42")] == [100]
+    assert [doc.id for doc in db.get_all_stickers("43")] == [200]
+
+
 def test_unknown_account_is_empty_not_error():
     db, _ = make_db()
     assert db.get_all_stickers("нет такого") == []
