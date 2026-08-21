@@ -967,7 +967,11 @@ def test_all_list_accessors_are_hooked():
         instance = plugin.MyPlugin()
         instance.on_plugin_load()
         names = [name for name, _ in instance.hooked_by_name]
-        assert names == ["getRecentStickers", "getRecentStickersNoCopy"], names
+        assert names == [
+            "getRecentStickers",
+            "getRecentStickersNoCopy",
+            "openForView",
+        ], names
         assert len(instance.hooked_methods) == 2, "addRecentSticker + isStickerInFavorites"
         assert instance.unhooked == []
     finally:
@@ -999,10 +1003,25 @@ def test_optional_accessor_absence_does_not_block_load():
         instance = plugin.MyPlugin()
         instance.fail_on = "getRecentStickersNoCopy"
         instance.on_plugin_load()
-        assert [n for n, _ in instance.hooked_by_name] == ["getRecentStickers"]
+        assert [n for n, _ in instance.hooked_by_name] == [
+            "getRecentStickers",
+            "openForView",
+        ]
         assert instance.unhooked == []
     finally:
         plugin.MyPlugin._MyPlugin__DB = None
+
+
+def test_openforview_is_hooked_but_not_required():
+    """Импорт - удобство: без openForView плагин обязан загрузиться."""
+    instance = make_plugin_with_db(make_db()[0])
+    instance.on_plugin_load()
+    assert "openForView" in [name for name, _ in instance.hooked_by_name]
+
+    instance = make_plugin_with_db(make_db()[0])
+    instance.fail_on = "openForView"
+    instance.on_plugin_load()
+    assert instance.unhooked == [], "отказ openForView не должен ронять загрузку"
 
 
 # --- create_settings / export --------------------------------------------

@@ -896,3 +896,13 @@ class MyPlugin(BasePlugin):
             "isStickerInFavorites",
             unhooks,
         )
+
+        # Перехват тапа по файлу бекапа. Не обязателен: без него теряется
+        # только импорт, а ради него ронять весь плагин незачем
+        self.__hook_by_name(
+            find_class("org.telegram.messenger.AndroidUtilities"),
+            "openForView",
+            ImportBackupHook(self.__on_backup_tap),
+            unhooks,
+            required=False,
+        )
