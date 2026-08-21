@@ -325,6 +325,50 @@ class StickersDB:
             "stickers": dict(self.__stickers["stickers"]),
         }
 
+    @staticmethod
+    def __is_valid_record(record) -> bool:
+        return isinstance(record, dict) and all(
+            key in record for key in REQUIRED_STICKER_FIELDS
+        )
+
+    def __drop_orphans(self):
+        """Записи, на которые не ссылается ни один аккаунт, не нужны"""
+        used = {
+            sticker_id
+            for ids in self.__stickers["accounts"].values()
+            for sticker_id in ids
+        }
+        for sticker_id in list(self.__stickers["stickers"]):
+            if sticker_id not in used:
+                del self.__stickers["stickers"][sticker_id]
+
+    def import_account(self, data: dict, account, replace: bool = False) -> tuple:
+        """Импорт плоского списка в аккаунт
+
+        ImportResult из спеки - это кортеж (применено, пропущено):
+        заводить датакласс ради двух чисел незачем.
+        """
+        account = str(account)
+        applied = skipped = 0
+        if replace:
+            self.__stickers["accounts"][account] = []
+        ids = self.__stickers["accounts"].setdefault(account, [])
+        # В файле новые сверху, база хранит наоборот
+        for record in reversed(data.get("stickers", [])):
+            if not self.__is_valid_record(record):
+                skipped += 1
+                log(f"[favstickers] Пропущена запись бекапа: {str(record)[:80]}")
+                continue
+            sticker_id = str(record["id"])
+            self.__stickers["stickers"][sticker_id] = record
+            if sticker_id not in ids:
+                ids.append(sticker_id)
+            applied += 1
+        self.__drop_orphans()
+        self.__cache.clear()
+        self.__save_db()
+        return applied, skipped
+
 
 class ChangeFavoriteStickerHook(MethodHook):
     def __init__(self, on_add_favorite, on_remove_favorite, refresh_panel, get_account_id):

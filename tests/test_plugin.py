@@ -498,6 +498,66 @@ def test_export_all_is_a_database_snapshot():
     assert data["stickers"]["100"]["id"] == 100
 
 
+def test_import_roundtrip_keeps_order():
+    source, _ = make_db()
+    source.add_sticker(FakeSticker(100), "42")
+    source.add_sticker(FakeSticker(200), "42")
+    target, _ = make_db()
+    applied, skipped = target.import_account(source.export_account("42"), "42")
+    assert (applied, skipped) == (2, 0)
+    assert [doc.id for doc in target.get_all_stickers("42")] == [200, 100]
+
+
+def test_import_into_another_account():
+    source, _ = make_db()
+    source.add_sticker(FakeSticker(100), "42")
+    target, _ = make_db()
+    target.import_account(source.export_account("42"), "999")
+    assert len(target.get_all_stickers("999")) == 1
+    assert target.get_all_stickers("42") == []
+
+
+def test_import_merge_is_idempotent():
+    db, _ = make_db()
+    db.add_sticker(FakeSticker(100), "42")
+    backup = db.export_account("42")
+    db.add_sticker(FakeSticker(200), "42")
+    db.import_account(backup, "42")
+    assert [doc.id for doc in db.get_all_stickers("42")] == [200, 100]
+
+
+def test_import_replace_wipes_previous():
+    db, _ = make_db()
+    db.add_sticker(FakeSticker(100), "42")
+    backup = db.export_account("42")
+    db.add_sticker(FakeSticker(200), "42")
+    db.import_account(backup, "42", replace=True)
+    assert [doc.id for doc in db.get_all_stickers("42")] == [100]
+
+
+def test_import_replace_drops_orphans():
+    """Запись, на которую больше никто не ссылается, не должна копиться."""
+    db, _ = make_db()
+    db.add_sticker(FakeSticker(100), "42")
+    backup = db.export_account("42")
+    db.add_sticker(FakeSticker(200), "42")
+    db.import_account(backup, "42", replace=True)
+    assert db.count_all() == (1, 1)
+
+
+def test_import_skips_broken_records():
+    db, _ = make_db()
+    applied, skipped = db.import_account(
+        {"stickers": [
+            {"id": 1, "access_hash": 2, "dc_id": 2, "mime_type": "image/webp"},
+            {"id": 2, "dc_id": 2},
+            "вообще не запись",
+        ]},
+        "42",
+    )
+    assert (applied, skipped) == (1, 2)
+
+
 def test_parse_backup_accepts_both_formats():
     account_file = json.dumps({"version": 1, "stickers": []})
     all_file = json.dumps({"version": 1, "accounts": {}, "stickers": {}})
