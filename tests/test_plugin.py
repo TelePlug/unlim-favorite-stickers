@@ -1170,6 +1170,57 @@ def test_recognition_failure_stays_silent():
     assert BULLETINS[before:] == [], BULLETINS[before:]
 
 
+# --- диалог и применение импорта ------------------------------------------
+
+
+def write_backup_file(data) -> str:
+    path = os.path.join(CACHE_DIR, "test-backup.stickers")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f)
+    return path
+
+
+def test_import_asks_before_applying():
+    source, _ = make_db()
+    source.add_sticker(FakeSticker(100), "42")
+    target, _ = make_db()
+    instance = make_plugin_with_db(target)
+    instance._MyPlugin__on_backup_tap(write_backup_file(source.export_account("42")))
+    assert DIALOGS[-1].shown
+    assert target.get_all_stickers("42") == [], "до подтверждения база не меняется"
+    DIALOGS[-1].press("positive")
+    assert len(target.get_all_stickers("42")) == 1
+
+
+def test_import_replace_saves_safety_snapshot():
+    source, _ = make_db()
+    source.add_sticker(FakeSticker(100), "42")
+    target, _ = make_db()
+    target.add_sticker(FakeSticker(999), "42")
+    instance = make_plugin_with_db(target)
+    instance._MyPlugin__on_backup_tap(write_backup_file(source.export_account("42")))
+    DIALOGS[-1].press("neutral")
+    assert [doc.id for doc in target.get_all_stickers("42")] == [100]
+    snapshots = [p for p in os.listdir(CACHE_DIR) if p.startswith("favorites-before-import")]
+    assert snapshots, os.listdir(CACHE_DIR)
+
+
+def test_import_of_broken_file_explains_why():
+    path = os.path.join(CACHE_DIR, "broken.stickers")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("{это не json")
+    instance = make_plugin_with_db(make_db()[0])
+    instance._MyPlugin__on_backup_tap(path)
+    assert BULLETINS[-1][0] == "error"
+    assert "бекап" in BULLETINS[-1][1].lower(), BULLETINS[-1]
+
+
+def test_import_of_missing_file_says_to_wait():
+    instance = make_plugin_with_db(make_db()[0])
+    instance._MyPlugin__on_backup_tap(os.path.join(CACHE_DIR, "нет-такого.stickers"))
+    assert BULLETINS[-1][0] == "info"
+
+
 # --- раннер ---------------------------------------------------------------
 
 if __name__ == "__main__":

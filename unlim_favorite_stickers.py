@@ -709,6 +709,86 @@ class MyPlugin(BasePlugin):
             log(f"[favstickers] Экспорт не удался: {e!r}")
             BulletinHelper.show_error("Не удалось выполнить экспорт", fragment)
 
+    def __on_backup_tap(self, file_path: str):
+        """Тап по файлу бекапа: прочитать, разобрать, спросить"""
+        fragment = None
+        try:
+            fragment = get_last_fragment()
+            if not os.path.exists(file_path):
+                BulletinHelper.show_info(
+                    "Файл ещё скачивается, дождитесь загрузки", fragment
+                )
+                return
+            data = parse_backup(read_file(file_path))
+        except BackupError as e:
+            BulletinHelper.show_error(str(e), fragment)
+            return
+        except Exception as e:
+            log(f"[favstickers] Не удалось прочитать бекап: {e!r}")
+            BulletinHelper.show_error("Не удалось прочитать файл бекапа", fragment)
+            return
+        run_on_ui_thread(lambda: self.__confirm_import(data))
+
+    def __confirm_import(self, data: dict):
+        """Диалог выбора между слиянием и заменой"""
+        fragment = None
+        try:
+            fragment = get_last_fragment()
+            activity = fragment.getParentActivity() if fragment else None
+            if activity is None:
+                # Без Activity диалог не показать, а молча заменять нельзя
+                self.__apply_import(data, replace=False)
+                return
+            count = len(data["stickers"])
+            builder = AlertDialogBuilder(activity)
+            builder.set_title("Импорт избранного")
+            builder.set_message(
+                f"В файле {count} стикеров. Добавить их к текущим или заменить?"
+            )
+            builder.set_positive_button(
+                "Добавить",
+                lambda b, w: (b.dismiss(), self.__apply_import(data, False)),
+            )
+            builder.set_neutral_button(
+                "Заменить",
+                lambda b, w: (b.dismiss(), self.__apply_import(data, True)),
+            )
+            builder.set_negative_button("Отмена", lambda b, w: b.dismiss())
+            builder.show()
+        except Exception as e:
+            log(f"[favstickers] Не удалось показать диалог импорта: {e!r}")
+            BulletinHelper.show_error("Не удалось показать диалог импорта", fragment)
+
+    def __save_safety_snapshot(self):
+        """Слепок перед заменой: единственная разрушительная операция плагина"""
+        path = os.path.join(
+            get_cache_dir(),
+            f"favorites-before-import-{dt.date.today().isoformat()}{BACKUP_SUFFIX}",
+        )
+        write_file(path, json.dumps(self.db.export_all(), ensure_ascii=False))
+        log(f"[favstickers] Страховочный слепок базы: {path}")
+
+    def __apply_import(self, data: dict, replace: bool):
+        fragment = None
+        try:
+            fragment = get_last_fragment()
+            if replace:
+                self.__save_safety_snapshot()
+            if detect_scope(data) == "all":
+                applied, skipped = self.db.import_all(data, replace)
+            else:
+                applied, skipped = self.db.import_account(
+                    data, self.__get_current_account_id(), replace
+                )
+            self.__notify_favorites_changed()
+            message = f"Импортировано {applied}"
+            if skipped:
+                message += f", пропущено {skipped}"
+            BulletinHelper.show_success(message, fragment)
+        except Exception as e:
+            log(f"[favstickers] Импорт не удался: {e!r}")
+            BulletinHelper.show_error("Не удалось импортировать бекап", fragment)
+
     def on_plugin_load(self):
         MediaController = find_class("org.telegram.messenger.MediaDataController")
         media_instance = MediaController.getInstance(self.__get_current_account())
