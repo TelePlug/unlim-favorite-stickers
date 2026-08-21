@@ -542,10 +542,12 @@ def test_import_all_skips_account_with_broken_list():
     backup = source.export_all()
     backup["accounts"]["43"] = "не список"
     target, _ = make_db()
+    before = len(LOGS)
     applied, skipped = target.import_all(backup)
     assert applied == 1, applied
     assert target.get_all_stickers("43") == []
     assert [doc.id for doc in target.get_all_stickers("42")] == [100]
+    assert any("43" in line for line in LOGS[before:]), LOGS[before:]
 
 
 def test_import_roundtrip_keeps_order():
