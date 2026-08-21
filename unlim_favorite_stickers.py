@@ -95,15 +95,24 @@ def backup_filename(scope: str) -> str:
 
 
 def detect_scope(data: dict) -> str:
-    """Слепок базы отличается от списка одного аккаунта ключом accounts"""
-    return "all" if isinstance(data.get("accounts"), dict) else "account"
+    """Слепок базы отличается от списка одного аккаунта ключом accounts
+
+    Условие обязано совпадать с первой веткой parse_backup: иначе файл
+    пройдёт разбор как один формат, а классифицируется как другой.
+    """
+    return (
+        "all"
+        if isinstance(data.get("accounts"), dict)
+        and isinstance(data.get("stickers"), dict)
+        else "account"
+    )
 
 
 def parse_backup(text: str) -> dict:
     """Разбор файла бекапа. На любой брак - BackupError с причиной"""
     try:
         data = json.loads(text)
-    except ValueError:
+    except (ValueError, RecursionError):
         raise BackupError("Файл не похож на бекап стикеров")
     if not isinstance(data, dict):
         raise BackupError("Файл не похож на бекап стикеров")

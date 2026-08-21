@@ -525,6 +525,15 @@ def test_parse_backup_without_version_is_not_a_backup():
         raise AssertionError("файл без версии должен быть отклонён")
 
 
+def test_parse_backup_survives_deeply_nested_json():
+    """C-декодер json кидает RecursionError, а не ValueError."""
+    try:
+        plugin.parse_backup("[" * 60000)
+    except plugin.BackupError:
+        return
+    raise AssertionError("глубокая вложенность должна давать BackupError")
+
+
 def test_parse_backup_rejects_garbage():
     for text in ("не json", json.dumps([1, 2]), json.dumps({"version": 1})):
         try:
@@ -532,6 +541,12 @@ def test_parse_backup_rejects_garbage():
         except plugin.BackupError:
             continue
         raise AssertionError(f"мусор принят за бекап: {text}")
+
+
+def test_scope_agrees_with_parser_on_mixed_file():
+    """accounts словарём, но stickers списком - это формат одного аккаунта."""
+    text = json.dumps({"version": 1, "accounts": {"42": ["1"]}, "stickers": []})
+    assert plugin.detect_scope(plugin.parse_backup(text)) == "account"
 
 
 def test_backup_filename_marks_scope():
