@@ -515,12 +515,21 @@ class ImportBackupHook(MethodHook):
             if not param.args:
                 return
             path = self.__backup_path(param.args[0])
-            if path is None:
-                return
-            param.setResult(False)
+        except Exception as e:
+            # Фаза опознания: файл ещё может быть чужим, поэтому только лог.
+            # Плашка тут напугала бы человека, открывающего свой pdf
+            log(f"[favstickers] Не удалось опознать файл: {e!r}")
+            return
+        if path is None:
+            return
+        param.setResult(False)
+        try:
             self.__on_backup_tap(path)
         except Exception as e:
-            log(f"[favstickers] Ошибка обработки тапа по файлу: {e!r}")
+            # Файл наш и открытие уже отменено: без плашки тап останется
+            # мёртвым, а причина - невидимой
+            log(f"[favstickers] Ошибка обработки бекапа: {e!r}")
+            BulletinHelper.show_error("Не удалось открыть бекап", get_last_fragment())
 
     @staticmethod
     def __backup_path(arg):

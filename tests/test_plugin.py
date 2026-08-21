@@ -1141,6 +1141,35 @@ def test_backup_tap_ignores_extension_case():
     assert len(taps) == 1
 
 
+def test_failed_callback_tells_the_user():
+    """Оригинал уже отменён: без плашки тап останется мёртвым."""
+
+    def boom(path):
+        raise RuntimeError("диалог не построился")
+
+    hook = plugin.ImportBackupHook(boom)
+    param = FakeParam([FakeFile("/cache/favorites.stickers")])
+    before = len(BULLETINS)
+    hook.before_hooked_method(param)
+    assert param.set_result_value is False, "оригинал должен остаться отменённым"
+    assert BULLETINS[before:] and BULLETINS[-1][0] == "error", BULLETINS[before:]
+
+
+def test_recognition_failure_stays_silent():
+    """Файл мог быть чужим - плашка от стикерного плагина тут неуместна."""
+
+    class Hostile:
+        def getAbsolutePath(self):
+            raise RuntimeError("путь недоступен")
+
+    hook = plugin.ImportBackupHook(lambda path: None)
+    param = FakeParam([Hostile()])
+    before = len(BULLETINS)
+    hook.before_hooked_method(param)
+    assert not param.result_was_set
+    assert BULLETINS[before:] == [], BULLETINS[before:]
+
+
 # --- раннер ---------------------------------------------------------------
 
 if __name__ == "__main__":
