@@ -469,6 +469,41 @@ def test_failed_save_tells_the_user():
     assert BULLETINS[before:] and BULLETINS[-1][0] == "error", BULLETINS[before:]
 
 
+def test_export_account_keeps_panel_order():
+    db, _ = make_db()
+    db.add_sticker(FakeSticker(100), "42")
+    db.add_sticker(FakeSticker(200), "42")
+    data = db.export_account("42")
+    assert data["version"] == 1
+    assert [s["id"] for s in data["stickers"]] == [200, 100], data["stickers"]
+
+
+def test_export_account_hides_account_ids():
+    """Файл одного аккаунта можно отправить другому человеку."""
+    db, _ = make_db()
+    db.add_sticker(FakeSticker(100), "42")
+    assert "accounts" not in db.export_account("42")
+    assert "42" not in json.dumps(db.export_account("42"))
+
+
+def test_export_all_is_a_database_snapshot():
+    db, _ = make_db()
+    db.add_sticker(FakeSticker(100), "42")
+    db.add_sticker(FakeSticker(200), "43")
+    data = db.export_all()
+    assert data["version"] == 1
+    assert sorted(data["accounts"]) == ["42", "43"]
+    assert sorted(data["stickers"]) == ["100", "200"]
+
+
+def test_counts_for_settings_screen():
+    db, _ = make_db()
+    db.add_sticker(FakeSticker(100), "42")
+    db.add_sticker(FakeSticker(200), "43")
+    assert db.count_stickers("42") == 1
+    assert db.count_all() == (2, 2)
+
+
 # --- ChangeFavoriteStickerHook -------------------------------------------
 
 

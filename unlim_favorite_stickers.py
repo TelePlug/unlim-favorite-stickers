@@ -232,6 +232,37 @@ class StickersDB:
             str(account), []
         )
 
+    def count_stickers(self, account) -> int:
+        """Сколько стикеров у аккаунта - без разбора, только длина списка"""
+        return len(self.__stickers["accounts"].get(str(account), []))
+
+    def count_all(self) -> tuple:
+        """(всего стикеров, всего аккаунтов)"""
+        return len(self.__stickers["stickers"]), len(self.__stickers["accounts"])
+
+    def export_account(self, account) -> dict:
+        """Плоский список в порядке панели, без упоминания аккаунтов"""
+        account = str(account)
+        return {
+            "version": BACKUP_VERSION,
+            "stickers": [
+                self.__stickers["stickers"][sticker_id]
+                for sticker_id in reversed(self.__stickers["accounts"].get(account, []))
+                if sticker_id in self.__stickers["stickers"]
+            ],
+        }
+
+    def export_all(self) -> dict:
+        """Слепок базы: восстанавливает все аккаунты по их id"""
+        return {
+            "version": BACKUP_VERSION,
+            "accounts": {
+                account: list(ids)
+                for account, ids in self.__stickers["accounts"].items()
+            },
+            "stickers": dict(self.__stickers["stickers"]),
+        }
+
 
 class ChangeFavoriteStickerHook(MethodHook):
     def __init__(self, on_add_favorite, on_remove_favorite, refresh_panel, get_account_id):
