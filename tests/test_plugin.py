@@ -515,6 +515,16 @@ def test_parse_backup_rejects_future_version():
         raise AssertionError("будущая версия должна быть отклонена")
 
 
+def test_parse_backup_without_version_is_not_a_backup():
+    """Чужой .stickers не должен советовать обновить плагин."""
+    try:
+        plugin.parse_backup(json.dumps({"stickers": []}))
+    except plugin.BackupError as e:
+        assert "не похож" in str(e), str(e)
+    else:
+        raise AssertionError("файл без версии должен быть отклонён")
+
+
 def test_parse_backup_rejects_garbage():
     for text in ("не json", json.dumps([1, 2]), json.dumps({"version": 1})):
         try:

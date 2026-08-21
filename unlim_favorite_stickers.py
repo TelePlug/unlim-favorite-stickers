@@ -107,8 +107,13 @@ def parse_backup(text: str) -> dict:
         raise BackupError("Файл не похож на бекап стикеров")
     if not isinstance(data, dict):
         raise BackupError("Файл не похож на бекап стикеров")
-    if data.get("version") != BACKUP_VERSION:
+    version = data.get("version")
+    if not isinstance(version, int):
+        raise BackupError("Файл не похож на бекап стикеров")
+    if version > BACKUP_VERSION:
         raise BackupError("Файл сделан более новой версией плагина")
+    if version != BACKUP_VERSION:
+        raise BackupError("Файл сделан несовместимой версией плагина")
     if isinstance(data.get("accounts"), dict) and isinstance(
         data.get("stickers"), dict
     ):
