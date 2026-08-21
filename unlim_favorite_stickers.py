@@ -675,31 +675,33 @@ class MyPlugin(BasePlugin):
 
     def __export_current(self):
         self.__export(
-            self.db.export_account(self.__get_current_account_id()),
-            backup_filename("account"),
+            lambda: self.db.export_account(self.__get_current_account_id()),
+            "account",
             "В избранном пусто, нечего экспортировать",
         )
 
     def __export_all(self):
         self.__export(
-            self.db.export_all(),
-            backup_filename("all"),
+            lambda: self.db.export_all(),
+            "all",
             "База пуста, нечего экспортировать",
         )
 
-    def __export(self, data: dict, filename: str, empty_message: str):
+    def __export(self, build_data, scope: str, empty_message: str):
         """Записать бекап в кеш и отправить себе в Избранное
 
-        Колбэк настроек выполняется в Java-UI, где исключение проглатывается
-        так же молча, как в хуках, поэтому каждая ветка заканчивается плашкой.
+        Данные строит переданная функция, а не вызывающий: обращение к базе
+        и к id аккаунта может бросить, а зовут нас прямо из Java-UI, где
+        исключение проглотится молча.
         """
         fragment = None
         try:
             fragment = get_last_fragment()
+            data = build_data()
             if not data.get("stickers"):
                 BulletinHelper.show_info(empty_message, fragment)
                 return
-            path = os.path.join(get_cache_dir(), filename)
+            path = os.path.join(get_cache_dir(), backup_filename(scope))
             write_file(path, json.dumps(data, ensure_ascii=False))
             # send_document ждет числовой peer, база ключуется строкой
             send_document(

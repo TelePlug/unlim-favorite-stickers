@@ -1091,6 +1091,26 @@ def test_settings_screen_survives_broken_db():
     assert any("favstickers" in line for line in LOGS[before:]), LOGS[before:]
 
 
+def test_export_reports_broken_db():
+    """Обращение к базе идёт из Java-UI: без плашки отказ будет невидим."""
+
+    class BrokenDB:
+        def count_stickers(self, account):
+            return 0
+
+        def count_all(self):
+            return (0, 0)
+
+        def export_account(self, account):
+            raise RuntimeError("база недоступна")
+
+    instance = make_plugin_with_db(BrokenDB())
+    before = len(BULLETINS)
+    instance.create_settings()[1].on_click(None)
+    assert BULLETINS[before:] and BULLETINS[-1][0] == "error", BULLETINS[before:]
+    assert any("favstickers" in line for line in LOGS[-3:]), LOGS[-3:]
+
+
 def test_export_reports_failure_without_fragment():
     """Падение get_last_fragment не должно съедать плашку об ошибке.
 
