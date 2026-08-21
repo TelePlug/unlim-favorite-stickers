@@ -62,6 +62,13 @@ class FakeBulletinHelper:
         BULLETINS.append(("error", text))
 
 
+class JInt:
+    """java.jint: мост боксирует такое значение как java.lang.Integer."""
+
+    def __init__(self, value):
+        self.value = value
+
+
 def fake_jclass(name):
     if name == "java.util.ArrayList":
         return FakeArrayList
@@ -97,6 +104,13 @@ class FakeBasePlugin:
         self.unhooked.append(unhook)
 
 
+JAVA_CLASSES = {}
+
+
+def fake_find_class(name):
+    return JAVA_CLASSES.setdefault(name, MagicMock())
+
+
 def install_stubs():
     android_utils = types.ModuleType("android_utils")
     android_utils.log = LOGS.append
@@ -106,10 +120,11 @@ def install_stubs():
     base_plugin.MethodHook = type("MethodHook", (), {})
 
     hook_utils = types.ModuleType("hook_utils")
-    hook_utils.find_class = lambda name: MagicMock()
+    hook_utils.find_class = fake_find_class
 
     java = types.ModuleType("java")
     java.jclass = fake_jclass
+    java.jint = JInt
 
     ui = types.ModuleType("ui")
     ui_bulletin = types.ModuleType("ui.bulletin")
@@ -318,10 +333,11 @@ def test_failed_save_tells_the_user():
 
 
 def make_change_hook():
-    calls = {"add": [], "remove": [], "update": 0}
+    calls = {"add": [], "remove": [], "refresh": []}
     hook = plugin.ChangeFavoriteStickerHook(
         on_add_favorite=lambda s, a: calls["add"].append((s, a)),
         on_remove_favorite=lambda s, a: calls["remove"].append((s, a)),
+        refresh_panel=lambda: calls["refresh"].append(True),
         get_account_id=lambda: "42",
     )
     return hook, calls
@@ -343,6 +359,25 @@ def test_fave_remove_goes_to_remove_branch():
     assert param.result_was_set
 
 
+def test_fave_change_refreshes_panel():
+    """Панель обновлял отмененный нами оригинал - теперь это наша забота."""
+    for remove in (False, True):
+        hook, calls = make_change_hook()
+        hook.before_hooked_method(
+            FakeParam([TYPE_FAVE, None, FakeSticker(100), 0, remove])
+        )
+        assert calls["refresh"] == [True], (remove, calls["refresh"])
+
+
+def test_refresh_passes_java_integer():
+    """Голый int мост боксирует в Long, а слушатель ждет Integer."""
+    plugin.MyPlugin._MyPlugin__notify_favorites_changed()
+    center = JAVA_CLASSES["org.telegram.messenger.NotificationCenter"]
+    args = center.getInstance.return_value.postNotificationName.call_args[0]
+    assert isinstance(args[2], JInt), type(args[2])
+    assert args[2].value == TYPE_FAVE
+
+
 def test_recent_sticker_is_left_alone():
     """Отправка стикера: TYPE_IMAGE не наш, оригинал отменять нельзя."""
     hook, calls = make_change_hook()
@@ -350,7 +385,7 @@ def test_recent_sticker_is_left_alone():
     hook.before_hooked_method(param)
     assert calls["add"] == [] and calls["remove"] == []
     assert not param.result_was_set, "недавние перестанут пополняться"
-    assert calls["update"] == 0
+    assert calls["refresh"] == []
 
 
 def test_mask_is_left_alone():
@@ -482,7 +517,7 @@ def boom(*args):
 
 def test_failed_write_leaves_original_alone():
     """Запись упала - пусть стикер уйдет хотя бы в ванильное избранное."""
-    hook = plugin.ChangeFavoriteStickerHook(boom, boom, lambda: "42")
+    hook = plugin.ChangeFavoriteStickerHook(boom, boom, lambda: None, lambda: "42")
     param = FakeParam([TYPE_FAVE, None, FakeSticker(100), 0, False])
     hook.before_hooked_method(param)
     assert not param.result_was_set, "оригинал отменять нечем - база не записана"

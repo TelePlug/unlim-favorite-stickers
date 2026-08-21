@@ -4,7 +4,7 @@ import os
 from android_utils import log
 from base_plugin import BasePlugin, MethodHook
 from hook_utils import find_class
-from java import jclass
+from java import jclass, jint
 from ui.bulletin import BulletinHelper
 
 __id__ = "favstickers"
@@ -202,9 +202,10 @@ class StickersDB:
 
 
 class ChangeFavoriteStickerHook(MethodHook):
-    def __init__(self, on_add_favorite, on_remove_favorite, get_account_id):
+    def __init__(self, on_add_favorite, on_remove_favorite, refresh_panel, get_account_id):
         self.__on_add_favorite = on_add_favorite
         self.__on_remove_favorite = on_remove_favorite
+        self.__refresh_panel = refresh_panel
         self.__get_account_id = get_account_id
 
     def before_hooked_method(self, param):
@@ -230,6 +231,8 @@ class ChangeFavoriteStickerHook(MethodHook):
             self.__on_remove_favorite(sticker, account_id)
             BulletinHelper.show_error("Sticker removed from favorites")
         param.setResult(None)
+        # Оригинал отменен, а перерисовку панели делал именно он
+        self.__refresh_panel()
 
 
 class GetFavoriteStickersHook(MethodHook):
@@ -313,6 +316,25 @@ class MyPlugin(BasePlugin):
         user_id = UserConfig.getInstance(UserConfig.selectedAccount).clientUserId
         return str(user_id)
 
+    @staticmethod
+    def __notify_favorites_changed():
+        """Просит панель стикеров перечитать избранное
+
+        В стоке это уведомление посылал addRecentSticker, а мы его
+        отменяем - без замены список не перерисуется, пока панель не
+        закрыть и открыть заново.
+
+        jint обязателен: postNotificationName принимает Object..., мост
+        боксирует питоновский int в Long, а слушатель делает
+        (Integer) args[1] и падает с ClassCastException внутри UI.
+        """
+        TYPE_FAVE = 2
+        NotificationCenter = find_class("org.telegram.messenger.NotificationCenter")
+        center = NotificationCenter.getInstance(MyPlugin.__get_current_account())
+        center.postNotificationName(
+            NotificationCenter.recentDocumentsDidLoad, False, jint(TYPE_FAVE)
+        )
+
     def __import_vanilla_favorites(self, stickers, account: str):
         """Первичное заполнение базы ванильным избранным
 
@@ -389,6 +411,7 @@ class MyPlugin(BasePlugin):
             ChangeFavoriteStickerHook(
                 on_add_favorite=self.db.add_sticker,
                 on_remove_favorite=self.db.remove_sticker,
+                refresh_panel=self.__notify_favorites_changed,
                 get_account_id=self.__get_current_account_id,
             ),
             "addRecentSticker",
