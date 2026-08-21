@@ -529,6 +529,13 @@ def test_emptied_account_is_not_counted():
     assert db.count_all() == (0, 0)
 
 
+def test_account_of_dangling_ids_is_not_counted():
+    """Список не пуст, но реальных стикеров в нём нет."""
+    db, _ = make_db({"accounts": {"42": ["нет-такого"]}, "stickers": {}})
+    assert db.count_stickers("42") == 0
+    assert db.count_all() == (0, 0)
+
+
 # --- ChangeFavoriteStickerHook -------------------------------------------
 
 

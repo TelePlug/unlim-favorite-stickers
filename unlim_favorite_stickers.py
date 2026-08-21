@@ -254,7 +254,9 @@ class StickersDB:
         Аккаунт, у которого удалили последний стикер, остаётся в базе с
         пустым списком - в счётчик для экрана настроек он попадать не должен.
         """
-        accounts = sum(1 for ids in self.__stickers["accounts"].values() if ids)
+        accounts = sum(
+            1 for account in self.__stickers["accounts"] if self.__ordered_ids(account)
+        )
         return len(self.__stickers["stickers"]), accounts
 
     def export_account(self, account) -> dict:
