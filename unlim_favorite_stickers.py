@@ -586,6 +586,67 @@ class MyPlugin(BasePlugin):
             return
         unhooks.extend(installed)
 
+    def create_settings(self) -> list:
+        """Экран настроек плагина
+
+        Счетчики в тексте кнопок, а не в subtext: у Text в установленной
+        версии ui.settings параметра subtext нет, и лишний аргумент уронил
+        бы построение экрана целиком.
+        """
+        own = self.db.count_stickers(self.__get_current_account_id())
+        total, accounts = self.db.count_all()
+        return [
+            Header(text="Бекап избранного"),
+            Text(
+                text=f"Экспорт текущего аккаунта ({own})",
+                on_click=lambda view: self.__export_current(),
+            ),
+            Text(
+                text=f"Экспорт всех аккаунтов ({total} в {accounts})",
+                on_click=lambda view: self.__export_all(),
+            ),
+            Divider(
+                text="Чтобы восстановить, откройте файл .stickers "
+                "в любом чате и подтвердите импорт"
+            ),
+        ]
+
+    def __export_current(self):
+        self.__export(
+            self.db.export_account(self.__get_current_account_id()),
+            backup_filename("account"),
+            "В избранном пусто, нечего экспортировать",
+        )
+
+    def __export_all(self):
+        self.__export(
+            self.db.export_all(),
+            backup_filename("all"),
+            "База пуста, нечего экспортировать",
+        )
+
+    def __export(self, data: dict, filename: str, empty_message: str):
+        """Записать бекап в кеш и отправить себе в Избранное
+
+        Колбэк настроек выполняется в Java-UI, где исключение проглатывается
+        так же молча, как в хуках, поэтому каждая ветка заканчивается плашкой.
+        """
+        fragment = get_last_fragment()
+        try:
+            if not data.get("stickers"):
+                BulletinHelper.show_info(empty_message, fragment)
+                return
+            path = os.path.join(get_cache_dir(), filename)
+            write_file(path, json.dumps(data, ensure_ascii=False))
+            # send_document ждет числовой peer, база ключуется строкой
+            send_document(
+                int(self.__get_current_account_id()), path, BACKUP_CAPTION
+            )
+            BulletinHelper.show_success("Бекап отправлен в Избранное", fragment)
+        except Exception as e:
+            log(f"[favstickers] Экспорт не удался: {e!r}")
+            BulletinHelper.show_error("Не удалось выполнить экспорт", fragment)
+
     def on_plugin_load(self):
         MediaController = find_class("org.telegram.messenger.MediaDataController")
         media_instance = MediaController.getInstance(self.__get_current_account())

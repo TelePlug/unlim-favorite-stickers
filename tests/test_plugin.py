@@ -4,6 +4,7 @@ StickersDB и хуки - чистый Python: Java нужна им только 
 который здесь подменён. Запуск: python test_plugin.py [путь_к_плагину]
 """
 
+import collections
 import importlib.util
 import json
 import os
@@ -54,12 +55,16 @@ class FakeTLRPC:
 
 class FakeBulletinHelper:
     @staticmethod
-    def show_success(text):
+    def show_success(text, fragment=None):
         BULLETINS.append(("success", text))
 
     @staticmethod
-    def show_error(text):
+    def show_error(text, fragment=None):
         BULLETINS.append(("error", text))
+
+    @staticmethod
+    def show_info(text, fragment=None):
+        BULLETINS.append(("info", text))
 
 
 class JInt:
@@ -182,11 +187,11 @@ class FakeBasePlugin:
         self.unhooked.append(unhook)
 
 
-JAVA_CLASSES = {}
+JAVA_CLASSES = collections.defaultdict(MagicMock)
 
 
 def fake_find_class(name):
-    return JAVA_CLASSES.setdefault(name, MagicMock())
+    return JAVA_CLASSES[name]
 
 
 def install_stubs():
@@ -998,6 +1003,56 @@ def test_optional_accessor_absence_does_not_block_load():
         assert instance.unhooked == []
     finally:
         plugin.MyPlugin._MyPlugin__DB = None
+
+
+# --- create_settings / export --------------------------------------------
+
+
+def make_plugin_with_db(db):
+    instance = plugin.MyPlugin()
+    instance._MyPlugin__DB = db
+    JAVA_CLASSES["org.telegram.messenger.UserConfig"].getInstance.return_value.clientUserId = 42
+    return instance
+
+
+def test_settings_screen_has_two_export_buttons():
+    db, _ = make_db()
+    db.add_sticker(FakeSticker(100), "42")
+    items = make_plugin_with_db(db).create_settings()
+    clickable = [i for i in items if getattr(i, "on_click", None)]
+    assert len(clickable) == 2, [i.text for i in items]
+    assert "1" in clickable[0].text, clickable[0].text
+    assert any(".stickers" in getattr(i, "text", "") for i in items), "нет подсказки про импорт"
+
+
+def test_export_sends_document_to_saved_messages():
+    db, _ = make_db()
+    db.add_sticker(FakeSticker(100), "42")
+    instance = make_plugin_with_db(db)
+    before = len(SENT_DOCUMENTS)
+    instance.create_settings()[1].on_click(None)
+    assert len(SENT_DOCUMENTS) == before + 1
+    peer, path, _ = SENT_DOCUMENTS[-1]
+    assert peer == 42, peer
+    assert path.endswith(".stickers"), path
+    assert json.load(open(path))["stickers"][0]["id"] == 100
+
+
+def test_export_all_writes_snapshot_format():
+    db, _ = make_db()
+    db.add_sticker(FakeSticker(100), "42")
+    instance = make_plugin_with_db(db)
+    instance.create_settings()[2].on_click(None)
+    data = json.load(open(SENT_DOCUMENTS[-1][1]))
+    assert "accounts" in data and "42" in data["accounts"]
+
+
+def test_export_of_empty_db_sends_nothing():
+    instance = make_plugin_with_db(make_db()[0])
+    before = len(SENT_DOCUMENTS)
+    instance.create_settings()[1].on_click(None)
+    assert len(SENT_DOCUMENTS) == before
+    assert BULLETINS[-1][0] == "info", BULLETINS[-1]
 
 
 # --- раннер ---------------------------------------------------------------
