@@ -499,6 +499,45 @@ class IsStickerInFavoritesHook(MethodHook):
         param.setResult(favorite)
 
 
+class ImportBackupHook(MethodHook):
+    """Перехват тапа по файлу .stickers в чате
+
+    Висит на всех перегрузках AndroidUtilities.openForView, то есть на любом
+    открываемом файле. Штатное открытие гасится строго после того, как имя
+    опознано - иначе плагин сломает открытие чужих вложений.
+    """
+
+    def __init__(self, on_backup_tap):
+        self.__on_backup_tap = on_backup_tap
+
+    def before_hooked_method(self, param):
+        try:
+            if not param.args:
+                return
+            path = self.__backup_path(param.args[0])
+            if path is None:
+                return
+            param.setResult(False)
+            self.__on_backup_tap(path)
+        except Exception as e:
+            log(f"[favstickers] Ошибка обработки тапа по файлу: {e!r}")
+
+    @staticmethod
+    def __backup_path(arg):
+        """Путь к нашему файлу, иначе None"""
+        if arg is None:
+            return None
+        if hasattr(arg, "getAbsolutePath"):
+            path = str(arg.getAbsolutePath())
+            return path if path.endswith(BACKUP_SUFFIX) else None
+        name = str(arg.getDocumentName()) if hasattr(arg, "getDocumentName") else ""
+        if not name.endswith(BACKUP_SUFFIX):
+            return None
+        # Скачанный файл лежит по attachPath
+        attach_path = getattr(getattr(arg, "messageOwner", None), "attachPath", None)
+        return str(attach_path) if attach_path else None
+
+
 class MyPlugin(BasePlugin):
     __DB = None
 

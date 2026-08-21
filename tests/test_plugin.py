@@ -1096,6 +1096,41 @@ def test_export_reports_failure_without_fragment():
     assert BULLETINS[-1][0] == "error", BULLETINS[-1]
 
 
+class FakeFile:
+    def __init__(self, path):
+        self.__path = path
+
+    def getAbsolutePath(self):
+        return self.__path
+
+
+def test_backup_tap_is_intercepted():
+    taps = []
+    hook = plugin.ImportBackupHook(taps.append)
+    param = FakeParam([FakeFile("/cache/favorites-2026-08-22.stickers")])
+    hook.before_hooked_method(param)
+    assert param.set_result_value is False
+    assert taps == ["/cache/favorites-2026-08-22.stickers"]
+
+
+def test_other_files_are_left_alone():
+    """Ошибка здесь ломает открытие любого вложения в мессенджере."""
+    taps = []
+    hook = plugin.ImportBackupHook(taps.append)
+    for arg in (FakeFile("/cache/doc.pdf"), FakeFile("/cache/photo.jpg"), None, object()):
+        param = FakeParam([arg])
+        hook.before_hooked_method(param)
+        assert not param.result_was_set, arg
+    assert taps == []
+
+
+def test_hook_survives_empty_args():
+    hook = plugin.ImportBackupHook(lambda path: None)
+    param = FakeParam([])
+    hook.before_hooked_method(param)
+    assert not param.result_was_set
+
+
 # --- раннер ---------------------------------------------------------------
 
 if __name__ == "__main__":
