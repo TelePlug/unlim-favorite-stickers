@@ -572,6 +572,24 @@ def test_import_of_wrong_format_does_not_wipe_account():
     assert [doc.id for doc in db.get_all_stickers("42")] == [100]
 
 
+def test_import_survives_record_that_breaks_on_str():
+    """Запись из файла может оказаться чем угодно, включая ломающую str()."""
+
+    class Hostile(dict):
+        def __str__(self):
+            raise ValueError("строковое представление недоступно")
+
+    db, _ = make_db()
+    db.add_sticker(FakeSticker(100), "42")
+    applied, skipped = db.import_account(
+        {"stickers": [Hostile(), {"id": 200, "access_hash": 1, "dc_id": 2,
+                                  "mime_type": "image/webp"}]},
+        "42",
+    )
+    assert (applied, skipped) == (1, 1), (applied, skipped)
+    assert [doc.id for doc in db.get_all_stickers("42")] == [200, 100]
+
+
 def test_parse_backup_accepts_both_formats():
     account_file = json.dumps({"version": 1, "stickers": []})
     all_file = json.dumps({"version": 1, "accounts": {}, "stickers": {}})

@@ -361,15 +361,25 @@ class StickersDB:
         ids = self.__stickers["accounts"].setdefault(account, [])
         # В файле новые сверху, база хранит наоборот
         for record in reversed(records):
-            if not self.__is_valid_record(record):
+            try:
+                if not self.__is_valid_record(record):
+                    # skipped считаем только после успешного лога: если сам
+                    # str(record) уронит эту строку, счётчик поправит внешний
+                    # except - а не оба обработчика на одной записи разом
+                    log(f"[favstickers] Пропущена запись бекапа: {str(record)[:80]}")
+                    skipped += 1
+                    continue
+                sticker_id = str(record["id"])
+                self.__stickers["stickers"][sticker_id] = record
+                if sticker_id not in ids:
+                    ids.append(sticker_id)
+                applied += 1
+            except Exception as e:
+                # Данные пришли из файла: и сама запись, и её строковое
+                # представление могут оказаться чем угодно. Одна такая
+                # не должна оставлять базу изменённой на середине импорта
                 skipped += 1
-                log(f"[favstickers] Пропущена запись бекапа: {str(record)[:80]}")
-                continue
-            sticker_id = str(record["id"])
-            self.__stickers["stickers"][sticker_id] = record
-            if sticker_id not in ids:
-                ids.append(sticker_id)
-            applied += 1
+                log(f"[favstickers] Запись бекапа не разобрана: {type(e).__name__}")
         self.__drop_orphans()
         self.__cache.clear()
         self.__save_db()
