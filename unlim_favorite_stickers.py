@@ -626,9 +626,9 @@ class MyPlugin(BasePlugin):
             raise RuntimeError(f"не удалось перехватить {name}")
         unhooks.append(unhook)
 
-    def __hook_by_name(self, media_class, name: str, hook, unhooks: list, required=True):
+    def __hook_by_name(self, owner_class, name: str, hook, unhooks: list, required=True):
         """Перехват всех перегрузок метода по имени"""
-        installed = self.hook_all_methods(media_class, name, hook)
+        installed = self.hook_all_methods(owner_class, name, hook)
         if not installed:
             if required:
                 raise RuntimeError(f"не удалось перехватить {name}")
@@ -835,6 +835,10 @@ class MyPlugin(BasePlugin):
 
         Хендлы нужны только на время загрузки: при выгрузке плагина мы хуки
         намеренно не снимаем.
+
+        Порядок важен: сначала обязательные хуки, необязательные последними.
+        Откат снимает всё поставленное до отказа, и при обратном порядке
+        отказ обязательного хука снимал бы уже работающие необязательные.
         """
         TLRPCDocument = find_class("org.telegram.tgnet.TLRPC$Document")
 
