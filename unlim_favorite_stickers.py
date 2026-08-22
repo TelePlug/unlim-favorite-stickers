@@ -16,8 +16,8 @@ from ui.settings import Divider, Header, Text
 __id__ = "favstickers"
 __name__ = "Unlim favorite stickers"
 __description__ = "Remove limits on adding stickers to favorites, with backup"
-__author__ = "@DaShMore"
-__version__ = "2.1.0"
+__author__ = "@DaShMore & @teleplugit"
+__version__ = "2.2.0"
 __icon__ = "plugins_covers/0"
 __min_version__ = "11.12.0"
 
