@@ -1,15 +1,21 @@
+import datetime as dt
 import json
 import os
+import uuid
 
-from android_utils import log
+from android_utils import log, run_on_ui_thread
 from base_plugin import BasePlugin, MethodHook
+from client_utils import get_last_fragment, send_document
+from file_utils import get_cache_dir, read_file, write_file
 from hook_utils import find_class
 from java import jclass, jint
+from ui.alert import AlertDialogBuilder
 from ui.bulletin import BulletinHelper
+from ui.settings import Divider, Header, Text
 
 __id__ = "favstickers"
 __name__ = "Unlim favorite stickers"
-__description__ = "Remove limits on adding stickers to favorites"
+__description__ = "Remove limits on adding stickers to favorites, with backup"
 __author__ = "@DaShMore"
 __version__ = "2.1.0"
 __icon__ = "plugins_covers/0"
@@ -24,6 +30,15 @@ class Jclass:
 J = Jclass()
 TLRPC = jclass("org.telegram.tgnet.TLRPC")
 ArrayList = jclass("java.util.ArrayList")
+
+BACKUP_VERSION = 1
+BACKUP_SUFFIX = ".stickers"
+BACKUP_CAPTION = "Бекап избранных стикеров"
+REQUIRED_STICKER_FIELDS = ("id", "access_hash", "dc_id", "mime_type")
+
+
+class BackupError(Exception):
+    """Причина отказа импорта, пригодная для показа пользователю"""
 
 
 def serialize_sticker(sticker) -> dict[str, str | int]:
@@ -72,6 +87,50 @@ def deserialize_sticker(data: dict):
     doc.attributes.add(a)
 
     return doc
+
+
+def backup_filename(scope: str) -> str:
+    """Имя файла бекапа: favorites-2026-08-22.stickers"""
+    suffix = "-all" if scope == "all" else ""
+    return f"favorites{suffix}-{dt.date.today().isoformat()}{BACKUP_SUFFIX}"
+
+
+def detect_scope(data: dict) -> str:
+    """Слепок базы отличается от списка одного аккаунта ключом accounts
+
+    Условие обязано совпадать с первой веткой parse_backup: иначе файл
+    пройдёт разбор как один формат, а классифицируется как другой.
+    """
+    return (
+        "all"
+        if isinstance(data.get("accounts"), dict)
+        and isinstance(data.get("stickers"), dict)
+        else "account"
+    )
+
+
+def parse_backup(text: str) -> dict:
+    """Разбор файла бекапа. На любой брак - BackupError с причиной"""
+    try:
+        data = json.loads(text)
+    except (ValueError, RecursionError):
+        raise BackupError("Файл не похож на бекап стикеров")
+    if not isinstance(data, dict):
+        raise BackupError("Файл не похож на бекап стикеров")
+    version = data.get("version")
+    if not isinstance(version, int):
+        raise BackupError("Файл не похож на бекап стикеров")
+    if version > BACKUP_VERSION:
+        raise BackupError("Файл сделан более новой версией плагина")
+    if version != BACKUP_VERSION:
+        raise BackupError("Файл сделан несовместимой версией плагина")
+    if isinstance(data.get("accounts"), dict) and isinstance(
+        data.get("stickers"), dict
+    ):
+        return data
+    if isinstance(data.get("stickers"), list):
+        return data
+    raise BackupError("Файл не похож на бекап стикеров")
 
 
 class StickersDB:
@@ -160,7 +219,7 @@ class StickersDB:
         if cached is not None:
             return cached
         stickers = []
-        for sticker_id in reversed(self.__stickers["accounts"].get(account, [])):
+        for sticker_id in self.__ordered_ids(account):
             data = self.__stickers["stickers"].get(sticker_id)
             if data is None:
                 continue
@@ -217,6 +276,145 @@ class StickersDB:
         return str(serialized_sticker["id"]) in self.__stickers["accounts"].get(
             str(account), []
         )
+
+    def __ordered_ids(self, account: str) -> list:
+        """Id стикеров аккаунта в порядке панели, без висячих ссылок
+
+        Правило одно для чтения, экспорта и счётчиков: иначе на кнопке
+        экспорта окажется одно число, а в файле другое.
+        """
+        return [
+            sticker_id
+            for sticker_id in reversed(self.__stickers["accounts"].get(account, []))
+            if sticker_id in self.__stickers["stickers"]
+        ]
+
+    def count_stickers(self, account) -> int:
+        """Сколько стикеров у аккаунта попадёт в панель и в экспорт"""
+        return len(self.__ordered_ids(str(account)))
+
+    def count_all(self) -> tuple[int, int]:
+        """(всего стикеров, аккаунтов с непустым избранным)
+
+        Аккаунт, у которого удалили последний стикер, остаётся в базе с
+        пустым списком - в счётчик для экрана настроек он попадать не должен.
+        """
+        accounts = sum(
+            1 for account in self.__stickers["accounts"] if self.__ordered_ids(account)
+        )
+        return len(self.__stickers["stickers"]), accounts
+
+    def export_account(self, account) -> dict:
+        """Плоский список в порядке панели, без упоминания аккаунтов"""
+        account = str(account)
+        return {
+            "version": BACKUP_VERSION,
+            "stickers": [
+                self.__stickers["stickers"][sticker_id]
+                for sticker_id in self.__ordered_ids(account)
+            ],
+        }
+
+    def export_all(self) -> dict:
+        """Слепок базы: восстанавливает все аккаунты по их id"""
+        return {
+            "version": BACKUP_VERSION,
+            "accounts": {
+                account: list(ids)
+                for account, ids in self.__stickers["accounts"].items()
+            },
+            "stickers": dict(self.__stickers["stickers"]),
+        }
+
+    @staticmethod
+    def __is_valid_record(record) -> bool:
+        return isinstance(record, dict) and all(
+            key in record for key in REQUIRED_STICKER_FIELDS
+        )
+
+    def __drop_orphans(self):
+        """Записи, на которые не ссылается ни один аккаунт, не нужны"""
+        used = {
+            sticker_id
+            for ids in self.__stickers["accounts"].values()
+            for sticker_id in ids
+        }
+        for sticker_id in list(self.__stickers["stickers"]):
+            if sticker_id not in used:
+                del self.__stickers["stickers"][sticker_id]
+
+    def import_account(self, data: dict, account, replace: bool = False) -> tuple:
+        """Импорт плоского списка в аккаунт
+
+        ImportResult из спеки - это кортеж (применено, пропущено):
+        заводить датакласс ради двух чисел незачем.
+        """
+        records = data.get("stickers", [])
+        # Проверяем форму до мутации: режим замены стирает список аккаунта,
+        # и на чужом формате это была бы потеря данных с отчётом (0, N),
+        # неотличимым от "файл был пустой"
+        if not isinstance(records, list):
+            raise BackupError("Файл не похож на бекап стикеров")
+        account = str(account)
+        applied = skipped = 0
+        if replace:
+            self.__stickers["accounts"][account] = []
+        ids = self.__stickers["accounts"].setdefault(account, [])
+        # В файле новые сверху, база хранит наоборот
+        for record in reversed(records):
+            try:
+                if not self.__is_valid_record(record):
+                    # skipped считаем только после успешного лога: если сам
+                    # str(record) уронит эту строку, счётчик поправит внешний
+                    # except - а не оба обработчика на одной записи разом
+                    log(f"[favstickers] Пропущена запись бекапа: {str(record)[:80]}")
+                    skipped += 1
+                    continue
+                sticker_id = str(record["id"])
+                self.__stickers["stickers"][sticker_id] = record
+                if sticker_id not in ids:
+                    ids.append(sticker_id)
+                applied += 1
+            except Exception as e:
+                # Данные пришли из файла: и сама запись, и её строковое
+                # представление могут оказаться чем угодно. Одна такая
+                # не должна оставлять базу изменённой на середине импорта
+                skipped += 1
+                log(f"[favstickers] Запись бекапа не разобрана: {type(e).__name__}")
+        self.__drop_orphans()
+        self.__cache.clear()
+        self.__save_db()
+        return applied, skipped
+
+    def import_all(self, data: dict, replace: bool = False) -> tuple:
+        """Импорт слепка: каждый аккаунт восстанавливается по своему id"""
+        accounts = data.get("accounts", {})
+        records = data.get("stickers", {})
+        # Форму слепка проверяем до первой мутации: import_account сохраняет
+        # базу после каждого аккаунта, и падение на середине оставило бы
+        # восстановление наполовину сделанным, да ещё и на диске
+        if not isinstance(accounts, dict) or not isinstance(records, dict):
+            raise BackupError("Файл не похож на бекап стикеров")
+        applied = skipped = 0
+        for account, ids in accounts.items():
+            if not isinstance(ids, list):
+                # Строка или словарь развернулись бы через reversed() молча,
+                # и аккаунт восстановился бы из мусора вместо стикеров
+                log(
+                    f"[favstickers] Пропущен аккаунт {account}: "
+                    "список стикеров испорчен"
+                )
+                continue
+            # import_account ждет порядок панели, в слепке порядок базы
+            payload = {
+                "stickers": [records[i] for i in reversed(ids) if i in records]
+            }
+            account_applied, account_skipped = self.import_account(
+                payload, account, replace
+            )
+            applied += account_applied
+            skipped += account_skipped
+        return applied, skipped
 
 
 class ChangeFavoriteStickerHook(MethodHook):
@@ -302,6 +500,57 @@ class IsStickerInFavoritesHook(MethodHook):
         param.setResult(favorite)
 
 
+class ImportBackupHook(MethodHook):
+    """Перехват тапа по файлу .stickers в чате
+
+    Висит на всех перегрузках AndroidUtilities.openForView, то есть на любом
+    открываемом файле. Штатное открытие гасится строго после того, как имя
+    опознано - иначе плагин сломает открытие чужих вложений.
+    """
+
+    def __init__(self, on_backup_tap):
+        self.__on_backup_tap = on_backup_tap
+
+    def before_hooked_method(self, param):
+        try:
+            if not param.args:
+                return
+            path = self.__backup_path(param.args[0])
+        except Exception as e:
+            # Фаза опознания: файл ещё может быть чужим, поэтому только лог.
+            # Плашка тут напугала бы человека, открывающего свой pdf
+            log(f"[favstickers] Не удалось опознать файл: {e!r}")
+            return
+        if path is None:
+            return
+        param.setResult(False)
+        try:
+            self.__on_backup_tap(path)
+        except Exception as e:
+            # Файл наш и открытие уже отменено: без плашки тап останется
+            # мёртвым, а причина - невидимой
+            log(f"[favstickers] Ошибка обработки бекапа: {e!r}")
+            BulletinHelper.show_error("Не удалось открыть бекап", get_last_fragment())
+
+    @staticmethod
+    def __backup_path(arg):
+        """Путь к нашему файлу, иначе None"""
+        if arg is None:
+            return None
+        if hasattr(arg, "getAbsolutePath"):
+            path = str(arg.getAbsolutePath())
+            return path if path.lower().endswith(BACKUP_SUFFIX) else None
+        name = str(arg.getDocumentName()) if hasattr(arg, "getDocumentName") else ""
+        if not name.lower().endswith(BACKUP_SUFFIX):
+            return None
+        # Файл ещё не скачан: не перехватываем намеренно. Перехват отменяет
+        # оригинал, а именно он, судя по всему, и запускает докачку - иначе
+        # тап показывал бы "дождитесь загрузки" и сам же её и предотвращал.
+        # Случай "путь есть, а файла на диске нет" ловится дальше, при чтении
+        attach_path = getattr(getattr(arg, "messageOwner", None), "attachPath", None)
+        return str(attach_path) if attach_path else None
+
+
 class MyPlugin(BasePlugin):
     __DB = None
 
@@ -377,9 +626,9 @@ class MyPlugin(BasePlugin):
             raise RuntimeError(f"не удалось перехватить {name}")
         unhooks.append(unhook)
 
-    def __hook_by_name(self, media_class, name: str, hook, unhooks: list, required=True):
+    def __hook_by_name(self, owner_class, name: str, hook, unhooks: list, required=True):
         """Перехват всех перегрузок метода по имени"""
-        installed = self.hook_all_methods(media_class, name, hook)
+        installed = self.hook_all_methods(owner_class, name, hook)
         if not installed:
             if required:
                 raise RuntimeError(f"не удалось перехватить {name}")
@@ -388,6 +637,183 @@ class MyPlugin(BasePlugin):
             log(f"[favstickers] {name} перехватить не удалось, пропускаем")
             return
         unhooks.extend(installed)
+
+    def create_settings(self) -> list:
+        """Экран настроек плагина
+
+        Счетчики в тексте кнопок, а не в subtext: у Text в установленной
+        версии ui.settings параметра subtext нет, и лишний аргумент уронил
+        бы построение экрана целиком.
+        """
+        try:
+            own = self.db.count_stickers(self.__get_current_account_id())
+            total, accounts = self.db.count_all()
+            return [
+                Header(text="Бекап избранного"),
+                Text(
+                    text=f"Экспорт текущего аккаунта ({own})",
+                    on_click=lambda view: self.__export_current(),
+                ),
+                Text(
+                    text=f"Экспорт всех аккаунтов ({total} в {accounts})",
+                    on_click=lambda view: self.__export_all(),
+                ),
+                Divider(
+                    text="Чтобы восстановить, откройте файл .stickers "
+                    "в любом чате и подтвердите импорт"
+                ),
+            ]
+        except Exception as e:
+            # Экран строится в Java-UI, где исключение глотается молча:
+            # без этой ветки пользователь получил бы пустые настройки
+            # безо всякого объяснения
+            log(f"[favstickers] Не удалось построить настройки: {e!r}")
+            return [
+                Header(text="Бекап избранного"),
+                Divider(text="Не удалось прочитать базу стикеров"),
+            ]
+
+    def __export_current(self):
+        self.__export(
+            lambda: self.db.export_account(self.__get_current_account_id()),
+            "account",
+            "В избранном пусто, нечего экспортировать",
+        )
+
+    def __export_all(self):
+        self.__export(
+            lambda: self.db.export_all(),
+            "all",
+            "База пуста, нечего экспортировать",
+        )
+
+    def __export(self, build_data, scope: str, empty_message: str):
+        """Записать бекап в кеш и отправить себе в Избранное
+
+        Данные строит переданная функция, а не вызывающий: обращение к базе
+        и к id аккаунта может бросить, а зовут нас прямо из Java-UI, где
+        исключение проглотится молча.
+        """
+        fragment = None
+        try:
+            fragment = get_last_fragment()
+            data = build_data()
+            if not data.get("stickers"):
+                BulletinHelper.show_info(empty_message, fragment)
+                return
+            path = os.path.join(get_cache_dir(), backup_filename(scope))
+            write_file(path, json.dumps(data, ensure_ascii=False))
+            # send_document ждет числовой peer, база ключуется строкой
+            send_document(
+                int(self.__get_current_account_id()), path, BACKUP_CAPTION
+            )
+            BulletinHelper.show_success("Бекап отправлен в Избранное", fragment)
+        except Exception as e:
+            log(f"[favstickers] Экспорт не удался: {e!r}")
+            BulletinHelper.show_error("Не удалось выполнить экспорт", fragment)
+
+    def __on_backup_tap(self, file_path: str):
+        """Тап по файлу бекапа: прочитать, разобрать, спросить"""
+        fragment = None
+        try:
+            fragment = get_last_fragment()
+            if not os.path.exists(file_path):
+                BulletinHelper.show_info(
+                    "Файл ещё скачивается, дождитесь загрузки", fragment
+                )
+                return
+            data = parse_backup(read_file(file_path))
+        except BackupError as e:
+            BulletinHelper.show_error(str(e), fragment)
+            return
+        except Exception as e:
+            log(f"[favstickers] Не удалось прочитать бекап: {e!r}")
+            BulletinHelper.show_error("Не удалось прочитать файл бекапа", fragment)
+            return
+        run_on_ui_thread(lambda: self.__confirm_import(data))
+
+    def __confirm_import(self, data: dict):
+        """Диалог выбора между слиянием и заменой"""
+        fragment = None
+        try:
+            fragment = get_last_fragment()
+            activity = fragment.getParentActivity() if fragment else None
+            if activity is None:
+                # Без Activity диалог не показать, а молча заменять нельзя
+                self.__apply_import(data, replace=False)
+                return
+            if detect_scope(data) == "all":
+                count = len(data["stickers"])
+                what = f"В файле {count} стикеров из {len(data['accounts'])} аккаунтов"
+            else:
+                what = f"В файле {len(data['stickers'])} стикеров"
+            builder = AlertDialogBuilder(activity)
+            builder.set_title("Импорт избранного")
+            builder.set_message(f"{what}. Добавить их к текущим или заменить?")
+            builder.set_positive_button(
+                "Добавить",
+                lambda b, w: (b.dismiss(), self.__apply_import(data, False)),
+            )
+            builder.set_neutral_button(
+                "Заменить",
+                lambda b, w: (b.dismiss(), self.__apply_import(data, True)),
+            )
+            builder.set_negative_button("Отмена", lambda b, w: b.dismiss())
+            builder.show()
+        except Exception as e:
+            log(f"[favstickers] Не удалось показать диалог импорта: {e!r}")
+            BulletinHelper.show_error("Не удалось показать диалог импорта", fragment)
+
+    def __save_safety_snapshot(self):
+        """Слепок перед заменой: единственная разрушительная операция плагина
+
+        Уходит в Избранное, а не только в кеш: кеш - приватный каталог
+        приложения, и без рута пользователь оттуда ничего не достанет.
+        В Избранном слепок можно просто открыть и импортировать обратно.
+
+        Хвост в имени не для красоты: отправка может читать файл позже,
+        и одноимённый слепок следующей замены испортил бы её содержимое.
+        """
+        stamp = dt.date.today().isoformat()
+        path = os.path.join(
+            get_cache_dir(),
+            f"favorites-before-import-{stamp}-{uuid.uuid4().hex[:6]}{BACKUP_SUFFIX}",
+        )
+        write_file(path, json.dumps(self.db.export_all(), ensure_ascii=False))
+        log(f"[favstickers] Страховочный слепок базы: {path}")
+        try:
+            send_document(
+                int(self.__get_current_account_id()),
+                path,
+                "Избранное до импорта",
+            )
+        except Exception as e:
+            # Копия в кеше уже есть, поэтому замену не отменяем: отказать
+            # в импорте из-за неудачной отправки хуже, чем импортировать
+            log(f"[favstickers] Не удалось отправить страховочный слепок: {e!r}")
+
+    def __apply_import(self, data: dict, replace: bool):
+        fragment = None
+        try:
+            fragment = get_last_fragment()
+            if replace:
+                self.__save_safety_snapshot()
+            if detect_scope(data) == "all":
+                applied, skipped = self.db.import_all(data, replace)
+            else:
+                applied, skipped = self.db.import_account(
+                    data, self.__get_current_account_id(), replace
+                )
+            self.__notify_favorites_changed()
+            message = f"Импортировано {applied}"
+            if skipped:
+                message += f", пропущено {skipped}"
+            if replace:
+                message += ". Прежнее избранное отправлено в Избранное"
+            BulletinHelper.show_success(message, fragment)
+        except Exception as e:
+            log(f"[favstickers] Импорт не удался: {e!r}")
+            BulletinHelper.show_error("Не удалось импортировать бекап", fragment)
 
     def on_plugin_load(self):
         MediaController = find_class("org.telegram.messenger.MediaDataController")
@@ -411,6 +837,10 @@ class MyPlugin(BasePlugin):
 
         Хендлы нужны только на время загрузки: при выгрузке плагина мы хуки
         намеренно не снимаем.
+
+        Порядок важен: сначала обязательные хуки, необязательные последними.
+        Откат снимает всё поставленное до отказа, и при обратном порядке
+        отказ обязательного хука снимал бы уже работающие необязательные.
         """
         TLRPCDocument = find_class("org.telegram.tgnet.TLRPC$Document")
 
@@ -471,4 +901,14 @@ class MyPlugin(BasePlugin):
             ),
             "isStickerInFavorites",
             unhooks,
+        )
+
+        # Перехват тапа по файлу бекапа. Не обязателен: без него теряется
+        # только импорт, а ради него ронять весь плагин незачем
+        self.__hook_by_name(
+            find_class("org.telegram.messenger.AndroidUtilities"),
+            "openForView",
+            ImportBackupHook(self.__on_backup_tap),
+            unhooks,
+            required=False,
         )

@@ -4,6 +4,7 @@ StickersDB и хуки - чистый Python: Java нужна им только 
 который здесь подменён. Запуск: python test_plugin.py [путь_к_плагину]
 """
 
+import collections
 import importlib.util
 import json
 import os
@@ -54,12 +55,16 @@ class FakeTLRPC:
 
 class FakeBulletinHelper:
     @staticmethod
-    def show_success(text):
+    def show_success(text, fragment=None):
         BULLETINS.append(("success", text))
 
     @staticmethod
-    def show_error(text):
+    def show_error(text, fragment=None):
         BULLETINS.append(("error", text))
+
+    @staticmethod
+    def show_info(text, fragment=None):
+        BULLETINS.append(("info", text))
 
 
 class JInt:
@@ -67,6 +72,84 @@ class JInt:
 
     def __init__(self, value):
         self.value = value
+
+
+class FakeSettingItem:
+    """Дataclass-подобные элементы ui.settings: важны поля, не поведение."""
+
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
+
+
+class FakeHeader(FakeSettingItem):
+    def __init__(self, text):
+        super().__init__(text=text)
+
+
+class FakeDivider(FakeSettingItem):
+    def __init__(self, text=""):
+        super().__init__(text=text)
+
+
+class FakeText(FakeSettingItem):
+    def __init__(self, text, on_click=None, **kwargs):
+        super().__init__(text=text, on_click=on_click, **kwargs)
+
+
+DIALOGS = []
+
+
+class FakeAlertDialogBuilder:
+    """Запоминает, что показали и какие кнопки повесили."""
+
+    def __init__(self, context):
+        self.context = context
+        self.title = None
+        self.message = None
+        self.buttons = {}
+        self.shown = False
+        DIALOGS.append(self)
+
+    def set_title(self, title):
+        self.title = title
+        return self
+
+    def set_message(self, message):
+        self.message = message
+        return self
+
+    def _button(self, kind, text, listener):
+        self.buttons[kind] = (text, listener)
+        return self
+
+    def set_positive_button(self, text, listener=None):
+        return self._button("positive", text, listener)
+
+    def set_neutral_button(self, text, listener=None):
+        return self._button("neutral", text, listener)
+
+    def set_negative_button(self, text, listener=None):
+        return self._button("negative", text, listener)
+
+    def show(self):
+        self.shown = True
+        return self
+
+    def dismiss(self):
+        return None
+
+    def press(self, kind):
+        """Нажать кнопку так, как это сделал бы пользователь."""
+        self.buttons[kind][1](self, 0)
+
+
+SENT_DOCUMENTS = []
+CACHE_DIR = tempfile.mkdtemp()
+
+
+class FakeFragment:
+    def getParentActivity(self):
+        return object()
 
 
 def fake_jclass(name):
@@ -104,16 +187,17 @@ class FakeBasePlugin:
         self.unhooked.append(unhook)
 
 
-JAVA_CLASSES = {}
+JAVA_CLASSES = collections.defaultdict(MagicMock)
 
 
 def fake_find_class(name):
-    return JAVA_CLASSES.setdefault(name, MagicMock())
+    return JAVA_CLASSES[name]
 
 
 def install_stubs():
     android_utils = types.ModuleType("android_utils")
     android_utils.log = LOGS.append
+    android_utils.run_on_ui_thread = lambda func, delay=0: func()
 
     base_plugin = types.ModuleType("base_plugin")
     base_plugin.BasePlugin = FakeBasePlugin
@@ -130,6 +214,25 @@ def install_stubs():
     ui_bulletin = types.ModuleType("ui.bulletin")
     ui_bulletin.BulletinHelper = FakeBulletinHelper
 
+    ui_settings = types.ModuleType("ui.settings")
+    ui_settings.Header = FakeHeader
+    ui_settings.Divider = FakeDivider
+    ui_settings.Text = FakeText
+
+    ui_alert = types.ModuleType("ui.alert")
+    ui_alert.AlertDialogBuilder = FakeAlertDialogBuilder
+
+    client_utils = types.ModuleType("client_utils")
+    client_utils.send_document = lambda peer, file_path, caption="": SENT_DOCUMENTS.append(
+        (peer, file_path, caption)
+    )
+    client_utils.get_last_fragment = FakeFragment
+
+    file_utils = types.ModuleType("file_utils")
+    file_utils.get_cache_dir = lambda: CACHE_DIR
+    file_utils.write_file = lambda path, content: open(path, "w", encoding="utf-8").write(content)
+    file_utils.read_file = lambda path: open(path, encoding="utf-8").read()
+
     sys.modules.update(
         {
             "android_utils": android_utils,
@@ -138,6 +241,10 @@ def install_stubs():
             "java": java,
             "ui": ui,
             "ui.bulletin": ui_bulletin,
+            "ui.settings": ui_settings,
+            "ui.alert": ui_alert,
+            "client_utils": client_utils,
+            "file_utils": file_utils,
         }
     )
 
@@ -367,6 +474,274 @@ def test_failed_save_tells_the_user():
     assert BULLETINS[before:] and BULLETINS[-1][0] == "error", BULLETINS[before:]
 
 
+def test_export_account_keeps_panel_order():
+    db, _ = make_db()
+    db.add_sticker(FakeSticker(100), "42")
+    db.add_sticker(FakeSticker(200), "42")
+    data = db.export_account("42")
+    assert data["version"] == 1
+    assert [s["id"] for s in data["stickers"]] == [200, 100], data["stickers"]
+
+
+def test_export_account_hides_account_ids():
+    """Файл одного аккаунта можно отправить другому человеку."""
+    db, _ = make_db()
+    db.add_sticker(FakeSticker(100), "42")
+    assert "accounts" not in db.export_account("42")
+    assert "42" not in json.dumps(db.export_account("42"))
+
+
+def test_export_all_is_a_database_snapshot():
+    db, _ = make_db()
+    db.add_sticker(FakeSticker(100), "42")
+    db.add_sticker(FakeSticker(200), "43")
+    data = db.export_all()
+    assert data["version"] == 1
+    assert sorted(data["accounts"]) == ["42", "43"]
+    assert sorted(data["stickers"]) == ["100", "200"]
+    assert data["accounts"]["42"] == ["100"], data["accounts"]
+    assert data["stickers"]["100"]["id"] == 100
+
+
+def test_import_all_restores_every_account():
+    source, _ = make_db()
+    source.add_sticker(FakeSticker(100), "42")
+    source.add_sticker(FakeSticker(200), "42")
+    source.add_sticker(FakeSticker(300), "43")
+    target, _ = make_db()
+    applied, skipped = target.import_all(source.export_all())
+    assert (applied, skipped) == (3, 0)
+    assert [doc.id for doc in target.get_all_stickers("42")] == [200, 100]
+    assert [doc.id for doc in target.get_all_stickers("43")] == [300]
+
+
+def test_import_all_replace_leaves_absent_accounts_alone():
+    """Замена трогает только аккаунты, которые есть в файле."""
+    source, _ = make_db()
+    source.add_sticker(FakeSticker(100), "42")
+    backup = source.export_all()
+    target, _ = make_db()
+    target.add_sticker(FakeSticker(999), "43")
+    target.import_all(backup, replace=True)
+    assert [doc.id for doc in target.get_all_stickers("43")] == [999]
+
+
+def test_import_all_rejects_broken_snapshot_before_touching_db():
+    """Падение на середине оставило бы базу восстановленной наполовину."""
+    db, _ = make_db()
+    db.add_sticker(FakeSticker(100), "42")
+    for broken in ({"accounts": [], "stickers": {}}, {"accounts": {}, "stickers": []}):
+        try:
+            db.import_all(broken, replace=True)
+        except plugin.BackupError:
+            pass
+        else:
+            raise AssertionError(f"испорченный слепок принят: {broken}")
+    assert [doc.id for doc in db.get_all_stickers("42")] == [100]
+
+
+def test_import_all_skips_account_with_broken_list():
+    """Строка вместо списка развернулась бы reversed() молча."""
+    source, _ = make_db()
+    source.add_sticker(FakeSticker(100), "42")
+    backup = source.export_all()
+    backup["accounts"]["43"] = "не список"
+    target, _ = make_db()
+    before = len(LOGS)
+    applied, skipped = target.import_all(backup)
+    assert applied == 1, applied
+    assert target.get_all_stickers("43") == []
+    assert [doc.id for doc in target.get_all_stickers("42")] == [100]
+    assert any("43" in line for line in LOGS[before:]), LOGS[before:]
+
+
+def test_import_roundtrip_keeps_order():
+    source, _ = make_db()
+    source.add_sticker(FakeSticker(100), "42")
+    source.add_sticker(FakeSticker(200), "42")
+    target, _ = make_db()
+    applied, skipped = target.import_account(source.export_account("42"), "42")
+    assert (applied, skipped) == (2, 0)
+    assert [doc.id for doc in target.get_all_stickers("42")] == [200, 100]
+
+
+def test_import_into_another_account():
+    source, _ = make_db()
+    source.add_sticker(FakeSticker(100), "42")
+    target, _ = make_db()
+    target.import_account(source.export_account("42"), "999")
+    assert len(target.get_all_stickers("999")) == 1
+    assert target.get_all_stickers("42") == []
+
+
+def test_import_merge_is_idempotent():
+    db, _ = make_db()
+    db.add_sticker(FakeSticker(100), "42")
+    backup = db.export_account("42")
+    db.add_sticker(FakeSticker(200), "42")
+    db.import_account(backup, "42")
+    assert [doc.id for doc in db.get_all_stickers("42")] == [200, 100]
+
+
+def test_import_replace_wipes_previous():
+    db, _ = make_db()
+    db.add_sticker(FakeSticker(100), "42")
+    backup = db.export_account("42")
+    db.add_sticker(FakeSticker(200), "42")
+    db.import_account(backup, "42", replace=True)
+    assert [doc.id for doc in db.get_all_stickers("42")] == [100]
+
+
+def test_import_replace_drops_orphans():
+    """Запись, на которую больше никто не ссылается, не должна копиться."""
+    db, _ = make_db()
+    db.add_sticker(FakeSticker(100), "42")
+    backup = db.export_account("42")
+    db.add_sticker(FakeSticker(200), "42")
+    db.import_account(backup, "42", replace=True)
+    assert db.count_all() == (1, 1)
+
+
+def test_import_skips_broken_records():
+    db, _ = make_db()
+    applied, skipped = db.import_account(
+        {"stickers": [
+            {"id": 1, "access_hash": 2, "dc_id": 2, "mime_type": "image/webp"},
+            {"id": 2, "dc_id": 2},
+            "вообще не запись",
+        ]},
+        "42",
+    )
+    assert (applied, skipped) == (1, 2)
+
+
+def test_import_of_wrong_format_does_not_wipe_account():
+    """Слепок базы в import_account: замена не должна стирать избранное."""
+    db, _ = make_db()
+    db.add_sticker(FakeSticker(100), "42")
+    snapshot = db.export_all()
+    try:
+        db.import_account(snapshot, "42", replace=True)
+    except plugin.BackupError:
+        pass
+    else:
+        raise AssertionError("чужой формат должен быть отвергнут")
+    assert [doc.id for doc in db.get_all_stickers("42")] == [100]
+
+
+def test_import_survives_record_that_breaks_on_str():
+    """Запись из файла может оказаться чем угодно, включая ломающую str()."""
+
+    class Hostile(dict):
+        def __str__(self):
+            raise ValueError("строковое представление недоступно")
+
+    db, _ = make_db()
+    db.add_sticker(FakeSticker(100), "42")
+    applied, skipped = db.import_account(
+        {"stickers": [Hostile(), {"id": 200, "access_hash": 1, "dc_id": 2,
+                                  "mime_type": "image/webp"}]},
+        "42",
+    )
+    assert (applied, skipped) == (1, 1), (applied, skipped)
+    assert [doc.id for doc in db.get_all_stickers("42")] == [200, 100]
+
+
+def test_parse_backup_accepts_both_formats():
+    account_file = json.dumps({"version": 1, "stickers": []})
+    all_file = json.dumps({"version": 1, "accounts": {}, "stickers": {}})
+    assert plugin.detect_scope(plugin.parse_backup(account_file)) == "account"
+    assert plugin.detect_scope(plugin.parse_backup(all_file)) == "all"
+
+
+def test_parse_backup_rejects_future_version():
+    text = json.dumps({"version": 99, "stickers": []})
+    try:
+        plugin.parse_backup(text)
+    except plugin.BackupError as e:
+        assert "новой версией" in str(e), str(e)
+    else:
+        raise AssertionError("будущая версия должна быть отклонена")
+
+
+def test_parse_backup_without_version_is_not_a_backup():
+    """Чужой .stickers не должен советовать обновить плагин."""
+    try:
+        plugin.parse_backup(json.dumps({"stickers": []}))
+    except plugin.BackupError as e:
+        assert "не похож" in str(e), str(e)
+    else:
+        raise AssertionError("файл без версии должен быть отклонён")
+
+
+def test_parse_backup_survives_deeply_nested_json():
+    """C-декодер json кидает RecursionError, а не ValueError."""
+    try:
+        plugin.parse_backup("[" * 60000)
+    except plugin.BackupError:
+        return
+    raise AssertionError("глубокая вложенность должна давать BackupError")
+
+
+def test_parse_backup_rejects_garbage():
+    for text in ("не json", json.dumps([1, 2]), json.dumps({"version": 1})):
+        try:
+            plugin.parse_backup(text)
+        except plugin.BackupError:
+            continue
+        raise AssertionError(f"мусор принят за бекап: {text}")
+
+
+def test_scope_agrees_with_parser_on_mixed_file():
+    """accounts словарём, но stickers списком - это формат одного аккаунта."""
+    text = json.dumps({"version": 1, "accounts": {"42": ["1"]}, "stickers": []})
+    assert plugin.detect_scope(plugin.parse_backup(text)) == "account"
+
+
+def test_backup_filename_marks_scope():
+    assert plugin.backup_filename("account").endswith(".stickers")
+    assert "-all-" in plugin.backup_filename("all")
+    assert "-all-" not in plugin.backup_filename("account")
+
+
+def test_counts_for_settings_screen():
+    db, _ = make_db()
+    db.add_sticker(FakeSticker(100), "42")
+    db.add_sticker(FakeSticker(200), "42")
+    db.add_sticker(FakeSticker(300), "43")
+    assert db.count_stickers("42") == 2
+    assert db.count_all() == (3, 2)
+
+
+def test_counts_ignore_dangling_ids():
+    """Счётчик на кнопке экспорта должен совпадать с содержимым файла."""
+    db, _ = make_db(
+        {
+            "accounts": {"42": ["100", "нет-такого"]},
+            "stickers": {
+                "100": {"id": 100, "access_hash": 1, "dc_id": 2,
+                        "mime_type": "image/webp"}
+            },
+        }
+    )
+    assert db.count_stickers("42") == 1
+    assert len(db.export_account("42")["stickers"]) == 1
+
+
+def test_emptied_account_is_not_counted():
+    db, _ = make_db()
+    db.add_sticker(FakeSticker(100), "42")
+    db.remove_sticker(FakeSticker(100), "42")
+    assert db.count_all() == (0, 0)
+
+
+def test_account_of_dangling_ids_is_not_counted():
+    """Список не пуст, но реальных стикеров в нём нет."""
+    db, _ = make_db({"accounts": {"42": ["нет-такого"]}, "stickers": {}})
+    assert db.count_stickers("42") == 0
+    assert db.count_all() == (0, 0)
+
+
 # --- ChangeFavoriteStickerHook -------------------------------------------
 
 
@@ -592,7 +967,11 @@ def test_all_list_accessors_are_hooked():
         instance = plugin.MyPlugin()
         instance.on_plugin_load()
         names = [name for name, _ in instance.hooked_by_name]
-        assert names == ["getRecentStickers", "getRecentStickersNoCopy"], names
+        assert names == [
+            "getRecentStickers",
+            "getRecentStickersNoCopy",
+            "openForView",
+        ], names
         assert len(instance.hooked_methods) == 2, "addRecentSticker + isStickerInFavorites"
         assert instance.unhooked == []
     finally:
@@ -624,10 +1003,347 @@ def test_optional_accessor_absence_does_not_block_load():
         instance = plugin.MyPlugin()
         instance.fail_on = "getRecentStickersNoCopy"
         instance.on_plugin_load()
-        assert [n for n, _ in instance.hooked_by_name] == ["getRecentStickers"]
+        assert [n for n, _ in instance.hooked_by_name] == [
+            "getRecentStickers",
+            "openForView",
+        ]
         assert instance.unhooked == []
     finally:
         plugin.MyPlugin._MyPlugin__DB = None
+
+
+def test_openforview_is_hooked_but_not_required():
+    """Импорт - удобство: без openForView плагин обязан загрузиться."""
+    instance = make_plugin_with_db(make_db()[0])
+    instance.on_plugin_load()
+    assert "openForView" in [name for name, _ in instance.hooked_by_name]
+
+    instance = make_plugin_with_db(make_db()[0])
+    instance.fail_on = "openForView"
+    instance.on_plugin_load()
+    assert instance.unhooked == [], "отказ openForView не должен ронять загрузку"
+
+
+# --- create_settings / export --------------------------------------------
+
+
+def make_plugin_with_db(db):
+    instance = plugin.MyPlugin()
+    instance._MyPlugin__DB = db
+    JAVA_CLASSES["org.telegram.messenger.UserConfig"].getInstance.return_value.clientUserId = 42
+    return instance
+
+
+def test_settings_screen_has_two_export_buttons():
+    db, _ = make_db()
+    db.add_sticker(FakeSticker(100), "42")
+    items = make_plugin_with_db(db).create_settings()
+    clickable = [i for i in items if getattr(i, "on_click", None)]
+    assert len(clickable) == 2, [i.text for i in items]
+    assert "1" in clickable[0].text, clickable[0].text
+    assert any(".stickers" in getattr(i, "text", "") for i in items), "нет подсказки про импорт"
+
+
+def test_export_sends_document_to_saved_messages():
+    db, _ = make_db()
+    db.add_sticker(FakeSticker(100), "42")
+    instance = make_plugin_with_db(db)
+    before = len(SENT_DOCUMENTS)
+    instance.create_settings()[1].on_click(None)
+    assert len(SENT_DOCUMENTS) == before + 1
+    peer, path, _ = SENT_DOCUMENTS[-1]
+    assert peer == 42, peer
+    assert path.endswith(".stickers"), path
+    assert json.load(open(path))["stickers"][0]["id"] == 100
+
+
+def test_export_all_writes_snapshot_format():
+    db, _ = make_db()
+    db.add_sticker(FakeSticker(100), "42")
+    instance = make_plugin_with_db(db)
+    instance.create_settings()[2].on_click(None)
+    data = json.load(open(SENT_DOCUMENTS[-1][1]))
+    assert "accounts" in data and "42" in data["accounts"]
+
+
+def test_export_of_empty_db_sends_nothing():
+    instance = make_plugin_with_db(make_db()[0])
+    before = len(SENT_DOCUMENTS)
+    instance.create_settings()[1].on_click(None)
+    assert len(SENT_DOCUMENTS) == before
+    assert BULLETINS[-1][0] == "info", BULLETINS[-1]
+
+
+def test_settings_screen_survives_broken_db():
+    """Экран строится в Java-UI: исключение отсюда никто не увидит."""
+
+    class BrokenDB:
+        def count_stickers(self, account):
+            raise RuntimeError("база недоступна")
+
+        def count_all(self):
+            raise RuntimeError("база недоступна")
+
+    instance = make_plugin_with_db(BrokenDB())
+    before = len(LOGS)
+    items = instance.create_settings()
+    assert items, "экран не должен оказаться пустым"
+    assert any("favstickers" in line for line in LOGS[before:]), LOGS[before:]
+
+
+def test_export_reports_broken_db():
+    """Обращение к базе идёт из Java-UI: без плашки отказ будет невидим."""
+
+    class BrokenDB:
+        def count_stickers(self, account):
+            return 0
+
+        def count_all(self):
+            return (0, 0)
+
+        def export_account(self, account):
+            raise RuntimeError("база недоступна")
+
+    instance = make_plugin_with_db(BrokenDB())
+    before = len(BULLETINS)
+    instance.create_settings()[1].on_click(None)
+    assert BULLETINS[before:] and BULLETINS[-1][0] == "error", BULLETINS[before:]
+    assert any("favstickers" in line for line in LOGS[-3:]), LOGS[-3:]
+
+
+def test_export_reports_failure_without_fragment():
+    """Падение get_last_fragment не должно съедать плашку об ошибке.
+
+    Плагин импортировал get_last_fragment по имени (from client_utils
+    import get_last_fragment), поэтому подмена атрибута на модуле
+    client_utils плагина не коснётся - __export резолвит имя в
+    пространстве имён самого модуля плагина. Подменяем там.
+    """
+    db, _ = make_db()
+    db.add_sticker(FakeSticker(100), "42")
+    instance = make_plugin_with_db(db)
+
+    def broken_get_last_fragment():
+        raise RuntimeError("нет фрагмента")
+
+    original = plugin.get_last_fragment
+    plugin.get_last_fragment = broken_get_last_fragment
+    try:
+        instance.create_settings()[1].on_click(None)
+    finally:
+        plugin.get_last_fragment = original
+    assert BULLETINS[-1][0] == "error", BULLETINS[-1]
+
+
+class FakeFile:
+    def __init__(self, path):
+        self.__path = path
+
+    def getAbsolutePath(self):
+        return self.__path
+
+
+def test_backup_tap_is_intercepted():
+    taps = []
+    hook = plugin.ImportBackupHook(taps.append)
+    param = FakeParam([FakeFile("/cache/favorites-2026-08-22.stickers")])
+    hook.before_hooked_method(param)
+    assert param.set_result_value is False
+    assert taps == ["/cache/favorites-2026-08-22.stickers"]
+
+
+def test_other_files_are_left_alone():
+    """Ошибка здесь ломает открытие любого вложения в мессенджере."""
+    taps = []
+    hook = plugin.ImportBackupHook(taps.append)
+    for arg in (FakeFile("/cache/doc.pdf"), FakeFile("/cache/photo.jpg"), None, object()):
+        param = FakeParam([arg])
+        hook.before_hooked_method(param)
+        assert not param.result_was_set, arg
+    assert taps == []
+
+
+def test_hook_survives_empty_args():
+    hook = plugin.ImportBackupHook(lambda path: None)
+    param = FakeParam([])
+    hook.before_hooked_method(param)
+    assert not param.result_was_set
+
+
+def test_backup_tap_ignores_extension_case():
+    """Файл могли переименовать вручную."""
+    taps = []
+    hook = plugin.ImportBackupHook(taps.append)
+    param = FakeParam([FakeFile("/cache/Favorites-2026-08-22.STICKERS")])
+    hook.before_hooked_method(param)
+    assert param.set_result_value is False
+    assert len(taps) == 1
+
+
+def test_failed_callback_tells_the_user():
+    """Оригинал уже отменён: без плашки тап останется мёртвым."""
+
+    def boom(path):
+        raise RuntimeError("диалог не построился")
+
+    hook = plugin.ImportBackupHook(boom)
+    param = FakeParam([FakeFile("/cache/favorites.stickers")])
+    before = len(BULLETINS)
+    hook.before_hooked_method(param)
+    assert param.set_result_value is False, "оригинал должен остаться отменённым"
+    assert BULLETINS[before:] and BULLETINS[-1][0] == "error", BULLETINS[before:]
+
+
+def test_recognition_failure_stays_silent():
+    """Файл мог быть чужим - плашка от стикерного плагина тут неуместна."""
+
+    class Hostile:
+        def getAbsolutePath(self):
+            raise RuntimeError("путь недоступен")
+
+    hook = plugin.ImportBackupHook(lambda path: None)
+    param = FakeParam([Hostile()])
+    before = len(BULLETINS)
+    hook.before_hooked_method(param)
+    assert not param.result_was_set
+    assert BULLETINS[before:] == [], BULLETINS[before:]
+
+
+class FakeMessageOwner:
+    def __init__(self, attach_path):
+        self.attachPath = attach_path
+
+
+class FakeMessageObject:
+    """Вложение в чате: именно так тап приходит в openForView"""
+
+    def __init__(self, name, attach_path=""):
+        self.__name = name
+        self.messageOwner = FakeMessageOwner(attach_path)
+
+    def getDocumentName(self):
+        return self.__name
+
+
+def test_backup_message_is_intercepted():
+    taps = []
+    hook = plugin.ImportBackupHook(taps.append)
+    param = FakeParam([FakeMessageObject("favorites.stickers", "/cache/downloaded.stickers")])
+    hook.before_hooked_method(param)
+    assert param.set_result_value is False
+    assert taps == ["/cache/downloaded.stickers"]
+
+
+def test_not_downloaded_message_is_left_to_telegram():
+    """Перехват отменил бы оригинал, а он же и запускает докачку."""
+    taps = []
+    hook = plugin.ImportBackupHook(taps.append)
+    param = FakeParam([FakeMessageObject("favorites.stickers", "")])
+    hook.before_hooked_method(param)
+    assert not param.result_was_set
+    assert taps == []
+
+
+def test_foreign_message_is_left_alone():
+    taps = []
+    hook = plugin.ImportBackupHook(taps.append)
+    param = FakeParam([FakeMessageObject("отчёт.pdf", "/cache/отчёт.pdf")])
+    hook.before_hooked_method(param)
+    assert not param.result_was_set
+    assert taps == []
+
+
+# --- диалог и применение импорта ------------------------------------------
+
+
+def write_backup_file(data) -> str:
+    path = os.path.join(CACHE_DIR, "test-backup.stickers")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f)
+    return path
+
+
+def test_import_asks_before_applying():
+    source, _ = make_db()
+    source.add_sticker(FakeSticker(100), "42")
+    target, _ = make_db()
+    instance = make_plugin_with_db(target)
+    instance._MyPlugin__on_backup_tap(write_backup_file(source.export_account("42")))
+    assert DIALOGS[-1].shown
+    assert target.get_all_stickers("42") == [], "до подтверждения база не меняется"
+    DIALOGS[-1].press("positive")
+    assert len(target.get_all_stickers("42")) == 1
+
+
+def test_import_replace_saves_safety_snapshot():
+    source, _ = make_db()
+    source.add_sticker(FakeSticker(100), "42")
+    target, _ = make_db()
+    target.add_sticker(FakeSticker(999), "42")
+    instance = make_plugin_with_db(target)
+    instance._MyPlugin__on_backup_tap(write_backup_file(source.export_account("42")))
+    DIALOGS[-1].press("neutral")
+    assert [doc.id for doc in target.get_all_stickers("42")] == [100]
+    snapshots = [p for p in os.listdir(CACHE_DIR) if p.startswith("favorites-before-import")]
+    assert snapshots, os.listdir(CACHE_DIR)
+
+
+def test_import_of_broken_file_explains_why():
+    path = os.path.join(CACHE_DIR, "broken.stickers")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("{это не json")
+    instance = make_plugin_with_db(make_db()[0])
+    instance._MyPlugin__on_backup_tap(path)
+    assert BULLETINS[-1][0] == "error"
+    assert "бекап" in BULLETINS[-1][1].lower(), BULLETINS[-1]
+
+
+def test_import_of_missing_file_says_to_wait():
+    instance = make_plugin_with_db(make_db()[0])
+    instance._MyPlugin__on_backup_tap(os.path.join(CACHE_DIR, "нет-такого.stickers"))
+    assert BULLETINS[-1][0] == "info"
+
+
+def test_safety_snapshot_goes_to_saved_messages():
+    """Кеш приватный: без рута пользователь оттуда ничего не достанет."""
+    source, _ = make_db()
+    source.add_sticker(FakeSticker(100), "42")
+    target, _ = make_db()
+    target.add_sticker(FakeSticker(999), "42")
+    instance = make_plugin_with_db(target)
+    instance._MyPlugin__on_backup_tap(write_backup_file(source.export_account("42")))
+    before = len(SENT_DOCUMENTS)
+    DIALOGS[-1].press("neutral")
+    sent = SENT_DOCUMENTS[before:]
+    assert sent, "слепок должен уйти в Избранное"
+    assert "before-import" in sent[-1][1], sent[-1]
+    assert json.load(open(sent[-1][1]))["accounts"]["42"] == ["999"]
+    assert "Избранное" in BULLETINS[-1][1], BULLETINS[-1]
+
+
+def test_two_replaces_keep_both_snapshots():
+    """Второй слепок не должен затирать первый - он и есть страховка."""
+    source, _ = make_db()
+    source.add_sticker(FakeSticker(100), "42")
+    backup = write_backup_file(source.export_account("42"))
+    target, _ = make_db()
+    target.add_sticker(FakeSticker(999), "42")
+    instance = make_plugin_with_db(target)
+    names = set()
+    for _ in range(2):
+        instance._MyPlugin__on_backup_tap(backup)
+        DIALOGS[-1].press("neutral")
+        names.add(SENT_DOCUMENTS[-1][1])
+    assert len(names) == 2, names
+
+
+def test_dialog_mentions_accounts_for_snapshot():
+    source, _ = make_db()
+    source.add_sticker(FakeSticker(100), "42")
+    source.add_sticker(FakeSticker(200), "43")
+    instance = make_plugin_with_db(make_db()[0])
+    instance._MyPlugin__on_backup_tap(write_backup_file(source.export_all()))
+    assert "аккаунт" in DIALOGS[-1].message, DIALOGS[-1].message
 
 
 # --- раннер ---------------------------------------------------------------
