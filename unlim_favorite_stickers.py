@@ -17,7 +17,7 @@ __id__ = "favstickers"
 __name__ = "Unlim favorite stickers"
 __description__ = "Remove limits on adding stickers to favorites, with backup"
 __author__ = "@DaShMore & @teleplugit"
-__version__ = "2.2.0"
+__version__ = "2.2.1"
 __icon__ = "plugins_covers/0"
 __min_version__ = "11.12.0"
 
@@ -626,17 +626,59 @@ class MyPlugin(BasePlugin):
             raise RuntimeError(f"не удалось перехватить {name}")
         unhooks.append(unhook)
 
+    @staticmethod
+    def __load_class(name: str, loader):
+        """Настоящий java.lang.Class по имени, иначе None
+
+        getDeclaredMethods есть только у Class, а find_class отдаёт обёртку
+        jclass - на ней зовут статику вроде UserConfig.getInstance. Загрузчик
+        берём явный: у вызова из Python своего загрузчика нет.
+        """
+        try:
+            return loader.loadClass(name)
+        except Exception as e:
+            log(f"[favstickers] Класс {name} не загрузился: {e!r}")
+            return None
+
     def __hook_by_name(self, owner_class, name: str, hook, unhooks: list, required=True):
-        """Перехват всех перегрузок метода по имени"""
-        installed = self.hook_all_methods(owner_class, name, hook)
-        if not installed:
-            if required:
-                raise RuntimeError(f"не удалось перехватить {name}")
-            # Метод есть не во всех сборках, и без него теряется только
-            # часть функциональности - не повод отказывать в загрузке
-            log(f"[favstickers] {name} перехватить не удалось, пропускаем")
-            return
+        """Перехват всех перегрузок метода по имени
+
+        Перегрузки перебираем сами и ставим через hook_method, а не через
+        hook_all_methods: у пользователя exteraGram тот вернул пусто для
+        getRecentStickers, хотя hook_method на addRecentSticker этого же
+        класса отработал, а ручной перебор те же перегрузки нашёл и
+        перехватил. Пустой ответ SDK не отличает "метода нет" от "хук не
+        встал", а здесь причина попадает и в лог, и в текст исключения.
+        """
+        methods = []
+        installed = []
+        problem = None
+        try:
+            methods = [m for m in owner_class.getDeclaredMethods() if str(m.getName()) == name]
+            if not methods:
+                problem = "метода нет в классе"
+            for method in methods:
+                method.setAccessible(True)
+                unhook = self.hook_method(method, hook)
+                if unhook is None:
+                    problem = f"hook_method отказал на {method}"
+                    continue
+                installed.append(unhook)
+        except Exception as e:
+            problem = repr(e)
+        # Откат в on_plugin_load снимает только то, что лежит в unhooks,
+        # поэтому поставленное сдаём и при отказе
         unhooks.extend(installed)
+        if problem is None:
+            return
+        reason = f"{name}: {problem} (найдено {len(methods)}, перехвачено {len(installed)})"
+        if required:
+            # Перегрузка без хука - это перегрузка, которую UI может позвать
+            # мимо нас: полурабочий плагин хуже неработающего
+            raise RuntimeError(f"не удалось перехватить {reason}")
+        # Метод есть не во всех сборках, и без него теряется только
+        # часть функциональности - не повод отказывать в загрузке
+        log(f"[favstickers] {reason}, пропускаем")
 
     def create_settings(self) -> list:
         """Экран настроек плагина
@@ -867,7 +909,7 @@ class MyPlugin(BasePlugin):
         )
 
         # Перехват методов получения списка избранных стикеров.
-        # hook_all_methods, а не getDeclaredMethod: набор перегрузок
+        # Все перегрузки по имени, а не getDeclaredMethod: набор перегрузок
         # getRecentStickers в разных сборках exteraGram отличается, и привязка
         # к одной сигнатуре молча промахивается мимо той, которую зовет UI.
         # getRecentStickersNoCopy идет тем же хуком - через него читают
@@ -905,10 +947,14 @@ class MyPlugin(BasePlugin):
 
         # Перехват тапа по файлу бекапа. Не обязателен: без него теряется
         # только импорт, а ради него ронять весь плагин незачем
-        self.__hook_by_name(
-            find_class("org.telegram.messenger.AndroidUtilities"),
-            "openForView",
-            ImportBackupHook(self.__on_backup_tap),
-            unhooks,
-            required=False,
+        android_utils_class = self.__load_class(
+            "org.telegram.messenger.AndroidUtilities", media_class.getClassLoader()
         )
+        if android_utils_class is not None:
+            self.__hook_by_name(
+                android_utils_class,
+                "openForView",
+                ImportBackupHook(self.__on_backup_tap),
+                unhooks,
+                required=False,
+            )
