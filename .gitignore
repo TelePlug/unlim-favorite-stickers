@@ -3,3 +3,4 @@
 .worktrees
 __pycache__
 stickers.json*
+.claude/worktrees
