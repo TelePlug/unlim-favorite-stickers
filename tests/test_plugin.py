@@ -152,6 +152,69 @@ class FakeFragment:
         return object()
 
 
+class FakeMethod:
+    """java.lang.reflect.Method: имя и сигнатура для опознания в тестах."""
+
+    def __init__(self, name, signature=""):
+        self.name = name
+        self.signature = signature
+
+    def getName(self):
+        return self.name
+
+    def setAccessible(self, flag):
+        pass
+
+    def __repr__(self):
+        return f"{self.name}({self.signature})"
+
+
+class FakeJavaClass:
+    """java.lang.Class с набором объявленных методов."""
+
+    def __init__(self, *methods):
+        self.methods = [FakeMethod(*m) if isinstance(m, tuple) else FakeMethod(m) for m in methods]
+
+    def getDeclaredMethods(self):
+        return list(self.methods)
+
+    def getDeclaredMethod(self, name, *types):
+        return FakeMethod(name, "exact")
+
+    def getClassLoader(self):
+        return FakeClassLoader
+
+    def without(self, name):
+        """Копия класса, в которой метода name нет - как в другой сборке."""
+        copy = FakeJavaClass()
+        copy.methods = [m for m in self.methods if m.name != name]
+        return copy
+
+
+
+MEDIA_CLASS = FakeJavaClass(
+    "addRecentSticker",
+    ("getRecentStickers", "int"),
+    ("getRecentStickers", "int, boolean"),
+    "getRecentStickersNoCopy",
+    "getRecentStickerSets",
+    "isStickerInFavorites",
+)
+
+# Классы, которые находит загрузчик приложения
+LOADABLE_CLASSES = {
+    "org.telegram.messenger.AndroidUtilities": FakeJavaClass("openForView", "runOnUIThread"),
+}
+
+
+class FakeClassLoader:
+    @staticmethod
+    def loadClass(name):
+        if name not in LOADABLE_CLASSES:
+            raise RuntimeError(f"ClassNotFoundException: {name}")
+        return LOADABLE_CLASSES[name]
+
+
 def fake_jclass(name):
     if name == "java.util.ArrayList":
         return FakeArrayList
@@ -164,30 +227,32 @@ def fake_jclass(name):
 class FakeBasePlugin:
     """Запоминает, что и как плагин просил перехватить."""
 
-    fail_on = None  # имя метода, перехват которого должен провалиться
+    # Имя метода или repr перегрузки ("getRecentStickers(int)"), на которой
+    # hook_method должен отказать. hook_all_methods нет намеренно: плагин
+    # не должен на него полагаться
+    fail_on = None
 
     def __init__(self):
         self.hooked_methods = []
-        self.hooked_by_name = []
         self.unhooked = []
 
     def hook_method(self, method, hook, priority=None):
-        if self.fail_on == "addRecentSticker" and not self.hooked_methods:
+        if self.fail_on in (method.getName(), repr(method)):
             return None
         self.hooked_methods.append((method, hook))
         return object()
 
-    def hook_all_methods(self, cls, method_name, hook, priority=None):
-        if method_name == self.fail_on:
-            return None
-        self.hooked_by_name.append((method_name, hook))
-        return [object()]
+    def hooked_names(self):
+        return [method.getName() for method, _ in self.hooked_methods]
 
     def unhook_method(self, unhook):
         self.unhooked.append(unhook)
 
 
 JAVA_CLASSES = collections.defaultdict(MagicMock)
+
+
+JAVA_CLASSES["org.telegram.messenger.MediaDataController"].getInstance.return_value.getClass.return_value = MEDIA_CLASS
 
 
 def fake_find_class(name):
@@ -960,68 +1025,103 @@ def test_hook_failures_are_logged():
     assert len(LOGS) > before, "падение хука прошло бесследно"
 
 
-def test_all_list_accessors_are_hooked():
-    """Правка охвата: оба аксессора вешаются по имени, а не по сигнатуре."""
+def load_plugin(fail_on=None, media_class=MEDIA_CLASS):
+    """on_plugin_load на фейковом SDK: (плагин, исключение загрузки или None)."""
+    getter = JAVA_CLASSES["org.telegram.messenger.MediaDataController"].getInstance.return_value
+    getter.getClass.return_value = media_class
     plugin.MyPlugin._MyPlugin__DB = FakeDB()
     try:
         instance = plugin.MyPlugin()
-        instance.on_plugin_load()
-        names = [name for name, _ in instance.hooked_by_name]
-        assert names == [
-            "getRecentStickers",
-            "getRecentStickersNoCopy",
-            "openForView",
-        ], names
-        assert len(instance.hooked_methods) == 2, "addRecentSticker + isStickerInFavorites"
-        assert instance.unhooked == []
+        instance.fail_on = fail_on
+        try:
+            instance.on_plugin_load()
+        except RuntimeError as e:
+            return instance, e
+        return instance, None
     finally:
         plugin.MyPlugin._MyPlugin__DB = None
+        getter.getClass.return_value = MEDIA_CLASS
+
+
+ALL_HOOKED = [
+    "addRecentSticker",
+    "getRecentStickers",
+    "getRecentStickers",
+    "getRecentStickersNoCopy",
+    "isStickerInFavorites",
+    "openForView",
+]
+
+
+def test_all_list_accessors_are_hooked():
+    """Правка охвата: аксессоры вешаются по имени, на каждую перегрузку."""
+    instance, error = load_plugin()
+    assert error is None, error
+    assert instance.hooked_names() == ALL_HOOKED, instance.hooked_names()
+    assert instance.unhooked == []
 
 
 def test_partial_install_is_rolled_back():
     """Полурабочий плагин хуже неработающего: снимаем уже поставленное."""
-    plugin.MyPlugin._MyPlugin__DB = FakeDB()
-    try:
-        instance = plugin.MyPlugin()
-        instance.fail_on = "getRecentStickers"
-        try:
-            instance.on_plugin_load()
-        except RuntimeError:
-            pass
-        else:
-            raise AssertionError("загрузка должна была прерваться")
-        # addRecentSticker успел встать до отказа - он должен быть снят
-        assert len(instance.unhooked) == 1, instance.unhooked
-    finally:
-        plugin.MyPlugin._MyPlugin__DB = None
+    instance, error = load_plugin(fail_on="getRecentStickers")
+    assert error is not None, "загрузка должна была прерваться"
+    # addRecentSticker успел встать до отказа - он должен быть снят
+    assert len(instance.unhooked) == 1, instance.unhooked
+
+
+def test_refused_overload_fails_load_and_rolls_back_its_sibling():
+    """Перегрузка без хука - дыра, через которую UI покажет ванильный список."""
+    instance, error = load_plugin(fail_on="getRecentStickers(int, boolean)")
+    assert error is not None, "одна неперехваченная перегрузка - уже отказ"
+    assert "найдено 2, перехвачено 1" in str(error), error
+    # addRecentSticker и успевшая встать соседняя перегрузка
+    assert len(instance.unhooked) == 2, instance.unhooked
+
+
+def test_missing_required_method_is_told_apart_from_refusal():
+    """Регрессия 2.2.0: "не удалось перехватить" без причины не чинится."""
+    instance, error = load_plugin(media_class=MEDIA_CLASS.without("getRecentStickers"))
+    assert error is not None
+    assert "метода нет в классе" in str(error), error
+    assert len(instance.unhooked) == 1, instance.unhooked
 
 
 def test_optional_accessor_absence_does_not_block_load():
     """getRecentStickersNoCopy есть не во всех сборках - это не отказ."""
-    plugin.MyPlugin._MyPlugin__DB = FakeDB()
-    try:
-        instance = plugin.MyPlugin()
-        instance.fail_on = "getRecentStickersNoCopy"
-        instance.on_plugin_load()
-        assert [n for n, _ in instance.hooked_by_name] == [
-            "getRecentStickers",
-            "openForView",
-        ]
+    for kwargs in (
+        {"fail_on": "getRecentStickersNoCopy"},
+        {"media_class": MEDIA_CLASS.without("getRecentStickersNoCopy")},
+    ):
+        before = len(LOGS)
+        instance, error = load_plugin(**kwargs)
+        assert error is None, (kwargs, error)
+        expected = [n for n in ALL_HOOKED if n != "getRecentStickersNoCopy"]
+        assert instance.hooked_names() == expected, (kwargs, instance.hooked_names())
         assert instance.unhooked == []
-    finally:
-        plugin.MyPlugin._MyPlugin__DB = None
+        assert any("getRecentStickersNoCopy" in line for line in LOGS[before:]), kwargs
 
 
 def test_openforview_is_hooked_but_not_required():
     """Импорт - удобство: без openForView плагин обязан загрузиться."""
-    instance = make_plugin_with_db(make_db()[0])
-    instance.on_plugin_load()
-    assert "openForView" in [name for name, _ in instance.hooked_by_name]
+    instance, error = load_plugin()
+    assert "openForView" in instance.hooked_names()
 
-    instance = make_plugin_with_db(make_db()[0])
-    instance.fail_on = "openForView"
-    instance.on_plugin_load()
+    instance, error = load_plugin(fail_on="openForView")
+    assert error is None, error
     assert instance.unhooked == [], "отказ openForView не должен ронять загрузку"
+
+
+def test_unloadable_android_utilities_does_not_block_load():
+    """Класс не загрузился - теряем только импорт по тапу."""
+    saved = LOADABLE_CLASSES.pop("org.telegram.messenger.AndroidUtilities")
+    try:
+        before = len(LOGS)
+        instance, error = load_plugin()
+        assert error is None, error
+        assert "openForView" not in instance.hooked_names()
+        assert any("AndroidUtilities" in line for line in LOGS[before:]), LOGS[before:]
+    finally:
+        LOADABLE_CLASSES["org.telegram.messenger.AndroidUtilities"] = saved
 
 
 # --- create_settings / export --------------------------------------------
